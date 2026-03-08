@@ -1,8 +1,9 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 /* ─────────────────────────────────────────────────
-   Photo Studio — Phase 2
-   Tone Curve, HSL, Undo/Redo, Presets, Batch Edit
+   Photo Studio — Phase 3
+   Crop/Rotate, Vignette, Grain, Split Toning,
+   Advanced Export
    ───────────────────────────────────────────────── */
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -37,6 +38,18 @@ const DEFAULT_ADJ = {
   toneCurveG: JSON.parse(JSON.stringify(DEFAULT_CURVE)),
   toneCurveB: JSON.parse(JSON.stringify(DEFAULT_CURVE)),
   hsl: DEFAULT_HSL(),
+  // Phase 3
+  vignette: 0,           // -100 to 100
+  vignetteFeather: 50,   // 0 to 100
+  grain: 0,              // 0 to 100
+  grainSize: 25,         // 0 to 100
+  splitHighHue: 40,      // 0 to 360
+  splitHighSat: 0,       // 0 to 100
+  splitShadHue: 220,     // 0 to 360
+  splitShadSat: 0,       // 0 to 100
+  splitBalance: 0,       // -100 to 100
+  rotation: 0,           // degrees
+  crop: null,            // { x, y, w, h } normalized 0-1, null = no crop
 };
 
 const deepClone = (o) => JSON.parse(JSON.stringify(o));
@@ -209,6 +222,69 @@ function applyAdjustments(ctx, img, adj, w, h) {
     d[i + 1] = clamp(g * 255, 0, 255);
     d[i + 2] = clamp(b * 255, 0, 255);
   }
+
+  // Post-processing passes (need x,y coordinates)
+  const vigAmt = adj.vignette / 100;
+  const vigFeather = 0.2 + (adj.vignetteFeather / 100) * 0.8;
+  const splitHiSat = adj.splitHighSat / 100;
+  const splitShSat = adj.splitShadSat / 100;
+  const splitBal = (adj.splitBalance + 100) / 200; // 0-1
+  const grainAmt = adj.grain / 100;
+  const grainSz = Math.max(1, Math.round(1 + (adj.grainSize / 100) * 3));
+  const needPostPass = vigAmt !== 0 || splitHiSat > 0 || splitShSat > 0 || grainAmt > 0;
+
+  if (needPostPass) {
+    // Pre-compute split toning colors
+    const [shR, shG, shB] = hsl2rgb(adj.splitShadHue, 1, 0.5);
+    const [hiR, hiG, hiB] = hsl2rgb(adj.splitHighHue, 1, 0.5);
+
+    for (let py = 0; py < h; py++) {
+      for (let px = 0; px < w; px++) {
+        const i = (py * w + px) * 4;
+        let r = d[i] / 255, g = d[i + 1] / 255, b = d[i + 2] / 255;
+
+        // Vignette
+        if (vigAmt !== 0) {
+          const dx = (px / w - 0.5) * 2;
+          const dy = (py / h - 0.5) * 2;
+          const dist = Math.sqrt(dx * dx + dy * dy) / 1.414;
+          const vig = 1 - smoothstep(vigFeather * 0.5, vigFeather, dist) * Math.abs(vigAmt);
+          if (vigAmt > 0) { r *= vig; g *= vig; b *= vig; }
+          else { const inv = 2 - vig; r *= inv; g *= inv; b *= inv; }
+        }
+
+        // Split Toning
+        if (splitHiSat > 0 || splitShSat > 0) {
+          const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+          if (splitShSat > 0 && lum < splitBal) {
+            const w2 = (1 - lum / Math.max(splitBal, 0.01)) * splitShSat * 0.3;
+            r = lerp(r, shR * lum * 2, w2);
+            g = lerp(g, shG * lum * 2, w2);
+            b = lerp(b, shB * lum * 2, w2);
+          }
+          if (splitHiSat > 0 && lum >= splitBal) {
+            const w2 = ((lum - splitBal) / Math.max(1 - splitBal, 0.01)) * splitHiSat * 0.3;
+            r = lerp(r, hiR * lum * 2, w2);
+            g = lerp(g, hiG * lum * 2, w2);
+            b = lerp(b, hiB * lum * 2, w2);
+          }
+        }
+
+        // Grain
+        if (grainAmt > 0) {
+          const gx = Math.floor(px / grainSz), gy = Math.floor(py / grainSz);
+          const seed = (gx * 12289 + gy * 7919 + gx * gy * 3571) & 0xFFFF;
+          const noise = ((seed / 65535) - 0.5) * grainAmt * 0.35;
+          r += noise; g += noise; b += noise;
+        }
+
+        d[i] = clamp(r * 255, 0, 255);
+        d[i + 1] = clamp(g * 255, 0, 255);
+        d[i + 2] = clamp(b * 255, 0, 255);
+      }
+    }
+  }
+
   ctx.putImageData(imageData, 0, 0);
 }
 
@@ -467,6 +543,292 @@ function PresetBar({ presets, onApply, onSave, onDelete }) {
   );
 }
 
+// ── Crop Overlay Tool ──
+const CROP_RATIOS = [
+  { label: "フリー", value: null },
+  { label: "1:1", value: 1 },
+  { label: "4:3", value: 4 / 3 },
+  { label: "3:2", value: 3 / 2 },
+  { label: "16:9", value: 16 / 9 },
+  { label: "5:4", value: 5 / 4 },
+];
+
+function CropOverlay({ imgW, imgH, crop, rotation, onChange, onRotate, canvasRect }) {
+  const [dragging, setDragging] = useState(null);
+  const [ratio, setRatio] = useState(null);
+  const startRef = useRef(null);
+
+  const cx = crop ? crop.x : 0, cy = crop ? crop.y : 0;
+  const cw = crop ? crop.w : 1, ch = crop ? crop.h : 1;
+
+  // Canvas pixel coords
+  const toPixel = (nx, ny) => ({
+    px: canvasRect.left + nx * canvasRect.width,
+    py: canvasRect.top + ny * canvasRect.height,
+  });
+
+  const fromPixel = (px, py) => ({
+    nx: clamp((px - canvasRect.left) / canvasRect.width, 0, 1),
+    ny: clamp((py - canvasRect.top) / canvasRect.height, 0, 1),
+  });
+
+  const tl = toPixel(cx, cy);
+  const br = toPixel(cx + cw, cy + ch);
+  const cropW = br.px - tl.px, cropH = br.py - tl.py;
+
+  const handleSize = 10;
+
+  const onMouseDown = (e, type) => {
+    e.stopPropagation();
+    startRef.current = { mx: e.clientX, my: e.clientY, cx, cy, cw, ch };
+    setDragging(type);
+  };
+
+  useEffect(() => {
+    if (!dragging) return;
+    const onMove = (e) => {
+      const s = startRef.current;
+      const dx = (e.clientX - s.mx) / canvasRect.width;
+      const dy = (e.clientY - s.my) / canvasRect.height;
+
+      let nx = s.cx, ny = s.cy, nw = s.cw, nh = s.ch;
+      if (dragging === "move") {
+        nx = clamp(s.cx + dx, 0, 1 - s.cw);
+        ny = clamp(s.cy + dy, 0, 1 - s.ch);
+      } else if (dragging === "br") {
+        nw = clamp(s.cw + dx, 0.05, 1 - s.cx);
+        nh = ratio ? nw / ratio * (imgW / imgH) : clamp(s.ch + dy, 0.05, 1 - s.cy);
+      } else if (dragging === "tl") {
+        const dw = clamp(s.cw - dx, 0.05, s.cx + s.cw);
+        const dh = ratio ? dw / ratio * (imgW / imgH) : clamp(s.ch - dy, 0.05, s.cy + s.ch);
+        nx = s.cx + s.cw - dw; ny = s.cy + s.ch - dh; nw = dw; nh = dh;
+      } else if (dragging === "tr") {
+        nw = clamp(s.cw + dx, 0.05, 1 - s.cx);
+        const dh = ratio ? nw / ratio * (imgW / imgH) : clamp(s.ch - dy, 0.05, s.cy + s.ch);
+        ny = s.cy + s.ch - dh; nh = dh;
+      } else if (dragging === "bl") {
+        const dw = clamp(s.cw - dx, 0.05, s.cx + s.cw);
+        nh = ratio ? dw / ratio * (imgW / imgH) : clamp(s.ch + dy, 0.05, 1 - s.cy);
+        nx = s.cx + s.cw - dw; nw = dw;
+      }
+      onChange({ x: nx, y: ny, w: clamp(nw, 0.05, 1), h: clamp(nh, 0.05, 1) });
+    };
+    const onUp = () => setDragging(null);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => { window.removeEventListener("mousemove", onMove); window.removeEventListener("mouseup", onUp); };
+  }, [dragging, canvasRect, ratio, imgW, imgH, onChange]);
+
+  const handleStyle = (pos) => ({
+    position: "absolute", width: handleSize, height: handleSize, background: "#fff", border: "1px solid #68b5ff",
+    cursor: pos === "tl" ? "nw-resize" : pos === "tr" ? "ne-resize" : pos === "bl" ? "sw-resize" : "se-resize",
+    ...(pos === "tl" ? { left: -handleSize / 2, top: -handleSize / 2 } :
+       pos === "tr" ? { right: -handleSize / 2, top: -handleSize / 2 } :
+       pos === "bl" ? { left: -handleSize / 2, bottom: -handleSize / 2 } :
+       { right: -handleSize / 2, bottom: -handleSize / 2 }),
+  });
+
+  // Rule of thirds
+  const thirds = [1/3, 2/3];
+
+  return (
+    <>
+      {/* Dark overlay outside crop */}
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none" }}>
+        <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: `${cy * 100}%`, background: "rgba(0,0,0,0.55)" }} />
+        <div style={{ position: "absolute", top: `${(cy + ch) * 100}%`, left: 0, right: 0, bottom: 0, background: "rgba(0,0,0,0.55)" }} />
+        <div style={{ position: "absolute", top: `${cy * 100}%`, left: 0, width: `${cx * 100}%`, height: `${ch * 100}%`, background: "rgba(0,0,0,0.55)" }} />
+        <div style={{ position: "absolute", top: `${cy * 100}%`, left: `${(cx + cw) * 100}%`, right: 0, height: `${ch * 100}%`, background: "rgba(0,0,0,0.55)" }} />
+      </div>
+
+      {/* Crop box */}
+      <div
+        onMouseDown={(e) => onMouseDown(e, "move")}
+        style={{
+          position: "absolute", left: `${cx * 100}%`, top: `${cy * 100}%`,
+          width: `${cw * 100}%`, height: `${ch * 100}%`,
+          border: "1px solid rgba(255,255,255,0.7)", cursor: "move", boxSizing: "border-box",
+        }}>
+        {/* Rule of thirds */}
+        {thirds.map((t) => (
+          <div key={`h${t}`} style={{ position: "absolute", left: 0, right: 0, top: `${t * 100}%`, height: 1, background: "rgba(255,255,255,0.2)", pointerEvents: "none" }} />
+        ))}
+        {thirds.map((t) => (
+          <div key={`v${t}`} style={{ position: "absolute", top: 0, bottom: 0, left: `${t * 100}%`, width: 1, background: "rgba(255,255,255,0.2)", pointerEvents: "none" }} />
+        ))}
+        {/* Corner handles */}
+        <div onMouseDown={(e) => onMouseDown(e, "tl")} style={handleStyle("tl")} />
+        <div onMouseDown={(e) => onMouseDown(e, "tr")} style={handleStyle("tr")} />
+        <div onMouseDown={(e) => onMouseDown(e, "bl")} style={handleStyle("bl")} />
+        <div onMouseDown={(e) => onMouseDown(e, "br")} style={handleStyle("br")} />
+      </div>
+
+      {/* Controls bar */}
+      <div style={{
+        position: "absolute", bottom: 8, left: "50%", transform: "translateX(-50%)",
+        display: "flex", gap: 4, background: "rgba(0,0,0,0.8)", borderRadius: 6, padding: "4px 8px", alignItems: "center",
+      }}>
+        {CROP_RATIOS.map((r) => (
+          <button key={r.label} onClick={() => {
+            setRatio(r.value);
+            if (r.value) {
+              const newH = cw / r.value * (imgW / imgH);
+              onChange({ x: cx, y: cy, w: cw, h: clamp(newH, 0.05, 1) });
+            }
+          }}
+          style={{
+            border: "none", background: ratio === r.value ? "#68b5ff" : "#444", color: ratio === r.value ? "#111" : "#bbb",
+            fontSize: 9, padding: "2px 6px", borderRadius: 3, cursor: "pointer", fontWeight: ratio === r.value ? 600 : 400,
+          }}>{r.label}</button>
+        ))}
+        <div style={{ width: 1, height: 14, background: "#555" }} />
+        <button onClick={() => onRotate(-90)} style={{ border: "none", background: "#444", color: "#bbb", fontSize: 12, padding: "2px 6px", borderRadius: 3, cursor: "pointer" }}>↺</button>
+        <button onClick={() => onRotate(90)} style={{ border: "none", background: "#444", color: "#bbb", fontSize: 12, padding: "2px 6px", borderRadius: 3, cursor: "pointer" }}>↻</button>
+      </div>
+    </>
+  );
+}
+
+// ── Export Dialog ──
+function ExportDialog({ photo, onExport, onClose }) {
+  const [format, setFormat] = useState("jpeg");
+  const [quality, setQuality] = useState(92);
+  const [resize, setResize] = useState("original");
+  const [customW, setCustomW] = useState(photo?.width || 1920);
+  const [customH, setCustomH] = useState(photo?.height || 1080);
+  const [keepAspect, setKeepAspect] = useState(true);
+
+  const aspectRatio = photo ? photo.width / photo.height : 1;
+
+  const sizeOptions = [
+    { key: "original", label: "オリジナル", w: photo?.width, h: photo?.height },
+    { key: "4k", label: "4K (3840px)", w: 3840, h: Math.round(3840 / aspectRatio) },
+    { key: "2k", label: "2K (2560px)", w: 2560, h: Math.round(2560 / aspectRatio) },
+    { key: "fhd", label: "Full HD (1920px)", w: 1920, h: Math.round(1920 / aspectRatio) },
+    { key: "hd", label: "HD (1280px)", w: 1280, h: Math.round(1280 / aspectRatio) },
+    { key: "web", label: "Web (800px)", w: 800, h: Math.round(800 / aspectRatio) },
+    { key: "custom", label: "カスタム" },
+  ];
+
+  const getSize = () => {
+    if (resize === "custom") return { w: customW, h: customH };
+    const opt = sizeOptions.find((o) => o.key === resize);
+    return { w: opt?.w || photo?.width, h: opt?.h || photo?.height };
+  };
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }}
+      onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()}
+        style={{ background: "#2a2a2a", borderRadius: 12, padding: 24, width: 360, maxHeight: "80vh", overflowY: "auto", border: "1px solid #444" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>エクスポート設定</span>
+          <button onClick={onClose} style={{ border: "none", background: "transparent", color: "#888", fontSize: 18, cursor: "pointer" }}>×</button>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: "#aaa", marginBottom: 6 }}>フォーマット</div>
+          <div style={{ display: "flex", gap: 4 }}>
+            {[{ key: "jpeg", label: "JPEG" }, { key: "png", label: "PNG" }, { key: "webp", label: "WebP" }].map((f) => (
+              <button key={f.key} onClick={() => setFormat(f.key)}
+                style={{
+                  flex: 1, border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer",
+                  background: format === f.key ? "#68b5ff" : "#333", color: format === f.key ? "#111" : "#bbb",
+                  fontWeight: format === f.key ? 600 : 400,
+                }}>{f.label}</button>
+            ))}
+          </div>
+        </div>
+
+        {format !== "png" && (
+          <div style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#aaa", marginBottom: 4 }}>
+              <span>品質</span><span style={{ color: "#68b5ff" }}>{quality}%</span>
+            </div>
+            <input type="range" min={10} max={100} value={quality} onChange={(e) => setQuality(parseInt(e.target.value))}
+              style={{ width: "100%", accentColor: "#68b5ff" }} />
+          </div>
+        )}
+
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: "#aaa", marginBottom: 6 }}>サイズ</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+            {sizeOptions.map((s) => (
+              <button key={s.key} onClick={() => setResize(s.key)}
+                style={{
+                  border: "1px solid #444", borderRadius: 4, padding: "5px 10px", fontSize: 11, cursor: "pointer",
+                  background: resize === s.key ? "#68b5ff" : "#333", color: resize === s.key ? "#111" : "#bbb",
+                  textAlign: "left", fontWeight: resize === s.key ? 600 : 400,
+                }}>
+                {s.label}{s.w && s.key !== "custom" ? ` (${s.w}×${s.h})` : ""}
+              </button>
+            ))}
+          </div>
+          {resize === "custom" && (
+            <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center" }}>
+              <input type="number" value={customW} onChange={(e) => {
+                const w = parseInt(e.target.value) || 1;
+                setCustomW(w);
+                if (keepAspect) setCustomH(Math.round(w / aspectRatio));
+              }} style={{ width: 80, background: "#333", border: "1px solid #555", borderRadius: 4, padding: "4px 6px", color: "#ccc", fontSize: 11 }} />
+              <span style={{ color: "#666" }}>×</span>
+              <input type="number" value={customH} onChange={(e) => {
+                const h = parseInt(e.target.value) || 1;
+                setCustomH(h);
+                if (keepAspect) setCustomW(Math.round(h * aspectRatio));
+              }} style={{ width: 80, background: "#333", border: "1px solid #555", borderRadius: 4, padding: "4px 6px", color: "#ccc", fontSize: 11 }} />
+              <label style={{ fontSize: 10, color: "#888", display: "flex", alignItems: "center", gap: 3, cursor: "pointer" }}>
+                <input type="checkbox" checked={keepAspect} onChange={() => setKeepAspect(!keepAspect)} /> 比率固定
+              </label>
+            </div>
+          )}
+        </div>
+
+        <button onClick={() => {
+          const size = getSize();
+          onExport({ format, quality: quality / 100, width: size.w, height: size.h });
+        }} style={{
+          width: "100%", border: "none", borderRadius: 6, padding: "10px 0", fontSize: 13,
+          background: "#68b5ff", color: "#111", fontWeight: 600, cursor: "pointer",
+        }}>エクスポート</button>
+      </div>
+    </div>
+  );
+}
+
+// ── Split Tone Hue Picker ──
+function HuePicker({ value, onChange, saturation = 50 }) {
+  const ref = useRef(null);
+  const W = 200, H = 16;
+
+  useEffect(() => {
+    if (!ref.current) return;
+    const ctx = ref.current.getContext("2d");
+    const grad = ctx.createLinearGradient(0, 0, W, 0);
+    for (let i = 0; i <= 12; i++) grad.addColorStop(i / 12, `hsl(${i * 30}, ${saturation}%, 50%)`);
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, W, H);
+    // Indicator
+    const x = (value / 360) * W;
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(x, H / 2, 6, 0, Math.PI * 2); ctx.stroke();
+  }, [value, saturation, W, H]);
+
+  const onInteract = (e) => {
+    const rect = ref.current.getBoundingClientRect();
+    const cx = e.touches ? e.touches[0].clientX : e.clientX;
+    const hue = clamp(Math.round(((cx - rect.left) / rect.width) * 360), 0, 360);
+    onChange(hue);
+  };
+
+  return (
+    <canvas ref={ref} width={W} height={H}
+      style={{ width: "100%", height: H, borderRadius: 4, cursor: "pointer", touchAction: "none" }}
+      onMouseDown={(e) => { onInteract(e); const move = (ev) => onInteract(ev); const up = () => { window.removeEventListener("mousemove", move); window.removeEventListener("mouseup", up); }; window.addEventListener("mousemove", move); window.addEventListener("mouseup", up); }}
+    />
+  );
+}
+
 // ═══ Main App ═══
 export default function PhotoStudio() {
   const [photos, setPhotos] = useState([]);
@@ -484,6 +846,8 @@ export default function PhotoStudio() {
   const [clipboardAdj, setClipboardAdj] = useState(null);
   const [multiSelect, setMultiSelect] = useState(new Set());
   const [toast, setToast] = useState(null);
+  const [cropMode, setCropMode] = useState(false);
+  const [showExportDialog, setShowExportDialog] = useState(false);
 
   const canvasRef = useRef(null);
   const imgCache = useRef({});
@@ -509,12 +873,41 @@ export default function PhotoStudio() {
     const canvas = canvasRef.current;
     const maxW = canvas.parentElement?.clientWidth || 800;
     const maxH = canvas.parentElement?.clientHeight || 600;
-    const scale = Math.min(maxW / img.width, maxH / img.height, 1);
-    const w = Math.round(img.width * scale), h = Math.round(img.height * scale);
+
+    const rot = photo.adjustments.rotation || 0;
+    const isRotated90 = rot === 90 || rot === -90 || rot === 270;
+    const srcW = isRotated90 ? img.height : img.width;
+    const srcH = isRotated90 ? img.width : img.height;
+
+    const scale = Math.min(maxW / srcW, maxH / srcH, 1);
+    const w = Math.round(srcW * scale), h = Math.round(srcH * scale);
     canvas.width = w; canvas.height = h;
     const ctx = canvas.getContext("2d", { willReadFrequently: true });
-    if (useOriginal) { ctx.clearRect(0, 0, w, h); ctx.drawImage(img, 0, 0, w, h); }
-    else applyAdjustments(ctx, img, photo.adjustments, w, h);
+
+    if (rot !== 0) {
+      ctx.save();
+      ctx.translate(w / 2, h / 2);
+      ctx.rotate((rot * Math.PI) / 180);
+      const drawW = isRotated90 ? h : w;
+      const drawH = isRotated90 ? w : h;
+      ctx.drawImage(img, -drawW / 2, -drawH / 2, drawW, drawH);
+      ctx.restore();
+      if (!useOriginal) {
+        const imageData = ctx.getImageData(0, 0, w, h);
+        ctx.putImageData(imageData, 0, 0);
+        // Re-draw rotated then apply adjustments
+        const tempCanvas = document.createElement("canvas");
+        tempCanvas.width = w; tempCanvas.height = h;
+        const tempCtx = tempCanvas.getContext("2d");
+        tempCtx.drawImage(canvas, 0, 0);
+        const tempImg = new Image();
+        await new Promise((res) => { tempImg.onload = res; tempImg.src = tempCanvas.toDataURL(); });
+        applyAdjustments(ctx, tempImg, photo.adjustments, w, h);
+      }
+    } else {
+      if (useOriginal) { ctx.clearRect(0, 0, w, h); ctx.drawImage(img, 0, 0, w, h); }
+      else applyAdjustments(ctx, img, photo.adjustments, w, h);
+    }
     setHistData(computeHistogram(ctx, w, h));
   }, [loadImage]);
 
@@ -626,13 +1019,73 @@ export default function PhotoStudio() {
     showToast(`「${preset.name}」適用`);
   }, [selected, updatePhoto, renderPreview, history, showToast]);
 
-  const exportPhoto = useCallback(async () => {
+  const exportPhoto = useCallback(async (opts = {}) => {
     if (!selected) return;
     const img = await loadImage(selected);
-    const ec = document.createElement("canvas"); ec.width = img.width; ec.height = img.height;
-    applyAdjustments(ec.getContext("2d", { willReadFrequently: true }), img, selected.adjustments, img.width, img.height);
-    ec.toBlob((blob) => { const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = `edited_${selected.name}`; a.click(); URL.revokeObjectURL(a.href); }, "image/jpeg", 0.95);
-  }, [selected, loadImage]);
+    const adj = selected.adjustments;
+    const rot = adj.rotation || 0;
+    const isRotated90 = rot === 90 || rot === -90 || rot === 270;
+
+    // Determine source dimensions after rotation
+    let srcW = isRotated90 ? img.height : img.width;
+    let srcH = isRotated90 ? img.width : img.height;
+
+    // Apply crop
+    const crop = adj.crop;
+    let cropX = 0, cropY = 0, cropW = srcW, cropH = srcH;
+    if (crop) {
+      cropX = Math.round(crop.x * srcW);
+      cropY = Math.round(crop.y * srcH);
+      cropW = Math.round(crop.w * srcW);
+      cropH = Math.round(crop.h * srcH);
+    }
+
+    // Target size
+    const targetW = opts.width || cropW;
+    const targetH = opts.height || cropH;
+    const format = opts.format || "jpeg";
+    const quality = opts.quality || 0.92;
+
+    // Step 1: Render full size with rotation
+    const fullCanvas = document.createElement("canvas");
+    fullCanvas.width = srcW; fullCanvas.height = srcH;
+    const fctx = fullCanvas.getContext("2d", { willReadFrequently: true });
+    if (rot !== 0) {
+      fctx.save();
+      fctx.translate(srcW / 2, srcH / 2);
+      fctx.rotate((rot * Math.PI) / 180);
+      const dw = isRotated90 ? srcH : srcW;
+      const dh = isRotated90 ? srcW : srcH;
+      fctx.drawImage(img, -dw / 2, -dh / 2, dw, dh);
+      fctx.restore();
+      // Apply adjustments to rotated image
+      const tempImg = new Image();
+      await new Promise((res) => { tempImg.onload = res; tempImg.src = fullCanvas.toDataURL(); });
+      applyAdjustments(fctx, tempImg, adj, srcW, srcH);
+    } else {
+      applyAdjustments(fctx, img, adj, srcW, srcH);
+    }
+
+    // Step 2: Crop
+    const cropCanvas = document.createElement("canvas");
+    cropCanvas.width = targetW; cropCanvas.height = targetH;
+    const cctx = cropCanvas.getContext("2d");
+    cctx.drawImage(fullCanvas, cropX, cropY, cropW, cropH, 0, 0, targetW, targetH);
+
+    // Step 3: Export
+    const mimeType = format === "png" ? "image/png" : format === "webp" ? "image/webp" : "image/jpeg";
+    const ext = format === "png" ? ".png" : format === "webp" ? ".webp" : ".jpg";
+    cropCanvas.toBlob((blob) => {
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      const baseName = selected.name.replace(/\.[^.]+$/, "");
+      a.download = `${baseName}_edited${ext}`;
+      a.click();
+      URL.revokeObjectURL(a.href);
+      showToast(`${targetW}×${targetH} ${format.toUpperCase()} でエクスポート`);
+    }, mimeType, format === "png" ? undefined : quality);
+    setShowExportDialog(false);
+  }, [selected, loadImage, showToast]);
 
   const filteredPhotos = useMemo(() => {
     let list = photos.filter((p) => {
@@ -715,7 +1168,11 @@ export default function PhotoStudio() {
               <button onClick={() => setShowBefore((v) => !v)} style={{ ...btn(C), background: showBefore ? "#555" : "transparent", fontSize: 11 }}>{showBefore ? "BEFORE" : "B/A"}</button>
               <button onClick={copyAdj} style={{ ...btn(C), fontSize: 11 }}>コピー</button>
               <button onClick={pasteAdj} style={{ ...btn(C), fontSize: 11, opacity: clipboardAdj ? 1 : 0.3 }}>ペースト</button>
-              <button onClick={exportPhoto} style={{ ...btn(C), background: C.accent, color: "#111", fontWeight: 600 }}>エクスポート</button>
+              <button onClick={() => setCropMode(!cropMode)}
+                style={{ ...btn(C), fontSize: 11, background: cropMode ? "#f59e0b" : "transparent", color: cropMode ? "#111" : C.text }}>
+                {cropMode ? "✓ 切抜" : "切抜"}
+              </button>
+              <button onClick={() => setShowExportDialog(true)} style={{ ...btn(C), background: C.accent, color: "#111", fontWeight: 600 }}>エクスポート</button>
             </>
           )}
           {mode === "library" && multiSelect.size > 0 && (
@@ -807,10 +1264,23 @@ export default function PhotoStudio() {
           ) : (
             <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", background: "#111", position: "relative" }}>
               {selected ? (
-                <>
-                  <canvas ref={canvasRef} style={{ maxWidth: "100%", maxHeight: "100%" }} />
+                <div style={{ position: "relative", display: "inline-block" }}>
+                  <canvas ref={canvasRef} style={{ maxWidth: "100%", maxHeight: "100%", display: "block" }} />
+                  {cropMode && (
+                    <CropOverlay
+                      imgW={selected.width} imgH={selected.height}
+                      crop={adj.crop || { x: 0, y: 0, w: 1, h: 1 }}
+                      rotation={adj.rotation || 0}
+                      onChange={(c) => updateAdj("crop", c)}
+                      onRotate={(deg) => {
+                        const r = ((adj.rotation || 0) + deg + 360) % 360;
+                        updateAdj("rotation", r);
+                      }}
+                      canvasRect={canvasRef.current?.getBoundingClientRect() || { left: 0, top: 0, width: 1, height: 1 }}
+                    />
+                  )}
                   {showBefore && <div style={{ position: "absolute", top: 12, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.7)", color: "#fff", fontSize: 11, padding: "3px 10px", borderRadius: 4, pointerEvents: "none" }}>BEFORE</div>}
-                </>
+                </div>
               ) : <div style={{ color: C.textDim }}>写真を選択してください</div>}
             </div>
           )}
@@ -890,6 +1360,39 @@ export default function PhotoStudio() {
               <Slider label="かすみの除去" value={adj.dehaze} min={-100} max={100} onChange={(v) => updateAdj("dehaze", v)} />
             </Section>
 
+            <Section title="ビネット" defaultOpen={false}>
+              <Slider label="適用量" value={adj.vignette} min={-100} max={100} onChange={(v) => updateAdj("vignette", v)} />
+              <Slider label="ぼかし" value={adj.vignetteFeather} min={0} max={100} onChange={(v) => updateAdj("vignetteFeather", v)} />
+            </Section>
+
+            <Section title="粒子" defaultOpen={false}>
+              <Slider label="適用量" value={adj.grain} min={0} max={100} onChange={(v) => updateAdj("grain", v)} />
+              <Slider label="サイズ" value={adj.grainSize} min={0} max={100} onChange={(v) => updateAdj("grainSize", v)} />
+            </Section>
+
+            <Section title="スプリットトーニング" defaultOpen={false}>
+              <div style={{ fontSize: 10, color: "#aaa", marginBottom: 4 }}>ハイライト</div>
+              <HuePicker value={adj.splitHighHue} saturation={adj.splitHighSat} onChange={(v) => updateAdj("splitHighHue", v)} />
+              <Slider label="彩度" value={adj.splitHighSat} min={0} max={100} onChange={(v) => updateAdj("splitHighSat", v)} />
+              <div style={{ fontSize: 10, color: "#aaa", marginBottom: 4, marginTop: 6 }}>シャドウ</div>
+              <HuePicker value={adj.splitShadHue} saturation={adj.splitShadSat} onChange={(v) => updateAdj("splitShadHue", v)} />
+              <Slider label="彩度" value={adj.splitShadSat} min={0} max={100} onChange={(v) => updateAdj("splitShadSat", v)} />
+              <Slider label="バランス" value={adj.splitBalance} min={-100} max={100} onChange={(v) => updateAdj("splitBalance", v)} />
+            </Section>
+
+            <Section title="変形" defaultOpen={false}>
+              <Slider label="回転" value={adj.rotation || 0} min={-180} max={180} step={1} onChange={(v) => updateAdj("rotation", v)} />
+              <div style={{ display: "flex", gap: 4, marginTop: 4 }}>
+                {[0, 90, 180, 270].map((r) => (
+                  <button key={r} onClick={() => updateAdj("rotation", r)}
+                    style={{ flex: 1, border: "1px solid #444", borderRadius: 3, padding: "3px 0", fontSize: 10, cursor: "pointer",
+                      background: (adj.rotation || 0) === r ? "#68b5ff" : "#333", color: (adj.rotation || 0) === r ? "#111" : "#888" }}>
+                    {r}°
+                  </button>
+                ))}
+              </div>
+            </Section>
+
             <div style={{ marginTop: 8, display: "flex", gap: 6 }}>
               <button onClick={() => {
                 if (!histData) return;
@@ -929,6 +1432,11 @@ export default function PhotoStudio() {
           </div>
         )}
       </div>
+
+      {/* Export Dialog */}
+      {showExportDialog && selected && (
+        <ExportDialog photo={selected} onExport={exportPhoto} onClose={() => setShowExportDialog(false)} />
+      )}
 
       {/* Toast */}
       {toast && <div style={{ position: "fixed", bottom: 24, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.85)", color: "#fff", fontSize: 12, padding: "8px 20px", borderRadius: 8, zIndex: 1000, pointerEvents: "none" }}>{toast}</div>}
