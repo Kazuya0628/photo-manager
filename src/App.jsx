@@ -1,9 +1,8 @@
 import { useState, useRef, useEffect, useCallback, useMemo } from "react";
 
 /* ─────────────────────────────────────────────────
-   Photo Studio — Phase 4
-   IndexedDB Persistence, Collections, Batch Export,
-   Zoom/Pan, Side-by-Side, Color Labels, Delete
+   Photo Studio — Phase 4.1
+   + Folder Import, HEIC Support, Progress UI
    ───────────────────────────────────────────────── */
 
 const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
@@ -94,6 +93,79 @@ async function dbClear(store) {
 }
 
 // ═══ Image Processing ═══
+
+// ── HEIC / File helpers ──
+const IMAGE_EXTS = /\.(jpe?g|png|gif|webp|bmp|tiff?|heic|heif|avif)$/i;
+const HEIC_EXTS = /\.(heic|heif)$/i;
+
+async function convertHEICtoJPEG(file) {
+  // Try native browser decode first (Safari supports HEIC natively)
+  try {
+    const bmp = await createImageBitmap(file);
+    const canvas = document.createElement("canvas");
+    canvas.width = bmp.width; canvas.height = bmp.height;
+    canvas.getContext("2d").drawImage(bmp, 0, 0);
+    bmp.close();
+    const blob = await new Promise((r) => canvas.toBlob(r, "image/jpeg", 0.95));
+    return new File([blob], file.name.replace(/\.(heic|heif)$/i, ".jpg"), { type: "image/jpeg" });
+  } catch (e) {
+    // If native fails, try heic2any library (loaded dynamically)
+    try {
+      if (!window._heic2any) {
+        const script = document.createElement("script");
+        script.src = "https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.4/heic2any.min.js";
+        await new Promise((res, rej) => { script.onload = res; script.onerror = rej; document.head.appendChild(script); });
+        window._heic2any = window.heic2any;
+      }
+      const blob = await window._heic2any({ blob: file, toType: "image/jpeg", quality: 0.92 });
+      const result = Array.isArray(blob) ? blob[0] : blob;
+      return new File([result], file.name.replace(/\.(heic|heif)$/i, ".jpg"), { type: "image/jpeg" });
+    } catch (e2) {
+      console.warn("HEIC conversion failed:", file.name, e2);
+      return null;
+    }
+  }
+}
+
+async function* scanDirectory(dirHandle, path = "") {
+  for await (const entry of dirHandle.values()) {
+    if (entry.kind === "file") {
+      if (IMAGE_EXTS.test(entry.name)) {
+        try {
+          const file = await entry.getFile();
+          yield { file, path: path ? `${path}/${entry.name}` : entry.name };
+        } catch (e) { /* skip inaccessible files */ }
+      }
+    } else if (entry.kind === "directory" && !entry.name.startsWith(".")) {
+      yield* scanDirectory(entry, path ? `${path}/${entry.name}` : entry.name);
+    }
+  }
+}
+
+// ── Progress Dialog ──
+function ImportProgress({ current, total, currentFile, onCancel }) {
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100 }}>
+      <div style={{ background: "#2a2a2a", borderRadius: 12, padding: 24, width: 380, border: "1px solid #444" }}>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "#fff", marginBottom: 16 }}>インポート中...</div>
+        <div style={{ position: "relative", height: 8, background: "#333", borderRadius: 4, overflow: "hidden", marginBottom: 10 }}>
+          <div style={{ position: "absolute", left: 0, top: 0, bottom: 0, width: `${pct}%`, background: "#68b5ff", borderRadius: 4, transition: "width 0.2s" }} />
+        </div>
+        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: "#aaa", marginBottom: 6 }}>
+          <span>{current} / {total} 枚</span>
+          <span>{pct}%</span>
+        </div>
+        <div style={{ fontSize: 10, color: "#666", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: 14 }}>
+          {currentFile || "スキャン中..."}
+        </div>
+        <button onClick={onCancel} style={{ width: "100%", border: "1px solid #555", borderRadius: 6, padding: "8px 0", fontSize: 12, cursor: "pointer", background: "#333", color: "#ccc" }}>
+          キャンセル
+        </button>
+      </div>
+    </div>
+  );
+}
 function buildCurveLUT(points) {
   const lut = new Float32Array(256);
   const sorted = [...points].sort((a, b) => a.x - b.x);
@@ -407,6 +479,8 @@ export default function PhotoStudio() {
   const [zoom, setZoom] = useState(1);
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [dbLoaded, setDbLoaded] = useState(false);
+  const [importProgress, setImportProgress] = useState(null); // { current, total, file }
+  const importCancelRef = useRef(false);
 
   const canvasRef = useRef(null);
   const beforeCanvasRef = useRef(null);
@@ -497,28 +571,138 @@ export default function PhotoStudio() {
     }
   }, [mode, selected, showBefore, compareMode, renderPreview]);
 
-  // Import
-  const importFiles = useCallback((files) => {
-    const imgs = Array.from(files).filter((f) => f.type.startsWith("image/"));
-    if (!imgs.length) return;
-    const newP = []; let loaded = 0;
-    imgs.forEach((file) => {
+  // Import single file helper (HEIC aware)
+  const processImageFile = useCallback(async (file) => {
+    let processedFile = file;
+    // HEIC conversion
+    if (HEIC_EXTS.test(file.name)) {
+      const converted = await convertHEICtoJPEG(file);
+      if (!converted) return null; // conversion failed
+      processedFile = converted;
+    }
+    // Check if browser can decode
+    if (!processedFile.type.startsWith("image/") && !IMAGE_EXTS.test(processedFile.name)) return null;
+
+    return new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = (e) => {
-        const img = new Image(); img.onload = () => {
-          const tc = document.createElement("canvas"); const s = Math.min(300 / img.width, 300 / img.height);
+        const img = new Image();
+        img.onload = () => {
+          const tc = document.createElement("canvas");
+          const s = Math.min(300 / img.width, 300 / img.height);
           tc.width = Math.round(img.width * s); tc.height = Math.round(img.height * s);
           tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
-          newP.push({ id: uid(), name: file.name, size: file.size, width: img.width, height: img.height, dataUrl: e.target.result, thumbUrl: tc.toDataURL("image/jpeg", 0.7), rating: 0, flag: "none", colorLabel: "none", tags: [], collectionIds: activeCollection ? [activeCollection] : [], adjustments: deepClone(DEFAULT_ADJ), importedAt: Date.now() });
-          loaded++;
-          if (loaded === imgs.length) {
-            setPhotos((prev) => { const u = [...prev, ...newP]; if (!selectedId && u.length > 0) setSelectedId(u[0].id); savePhotos(u); return u; });
-            showToast(`${imgs.length} 枚インポート`);
-          }
-        }; img.src = e.target.result;
-      }; reader.readAsDataURL(file);
+          resolve({
+            id: uid(), name: file.name, size: file.size, width: img.width, height: img.height,
+            dataUrl: e.target.result, thumbUrl: tc.toDataURL("image/jpeg", 0.7),
+            rating: 0, flag: "none", colorLabel: "none", tags: [],
+            collectionIds: activeCollection ? [activeCollection] : [],
+            adjustments: deepClone(DEFAULT_ADJ), importedAt: Date.now(),
+          });
+        };
+        img.onerror = () => resolve(null);
+        img.src = e.target.result;
+      };
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(processedFile);
     });
-  }, [selectedId, showToast, savePhotos, activeCollection]);
+  }, [activeCollection]);
+
+  // Import from file list (drag & drop or file picker)
+  const importFiles = useCallback(async (files) => {
+    const allFiles = Array.from(files).filter((f) => f.type.startsWith("image/") || HEIC_EXTS.test(f.name) || IMAGE_EXTS.test(f.name));
+    if (!allFiles.length) return;
+
+    importCancelRef.current = false;
+    setImportProgress({ current: 0, total: allFiles.length, file: "" });
+
+    const newPhotos = [];
+    for (let i = 0; i < allFiles.length; i++) {
+      if (importCancelRef.current) break;
+      setImportProgress({ current: i, total: allFiles.length, file: allFiles[i].name });
+      const photo = await processImageFile(allFiles[i]);
+      if (photo) newPhotos.push(photo);
+      // Add in batches of 20 to show progress in UI
+      if (newPhotos.length > 0 && (newPhotos.length % 20 === 0 || i === allFiles.length - 1)) {
+        const batch = newPhotos.splice(0, newPhotos.length);
+        setPhotos((prev) => {
+          const u = [...prev, ...batch];
+          if (!selectedId && u.length > 0) setSelectedId(u[0].id);
+          savePhotos(u);
+          return u;
+        });
+      }
+    }
+    setImportProgress(null);
+    showToast(`${allFiles.length} 枚インポート完了`);
+  }, [selectedId, showToast, savePhotos, processImageFile]);
+
+  // Folder import via File System Access API
+  const importFolder = useCallback(async () => {
+    if (!window.showDirectoryPicker) {
+      showToast("このブラウザではフォルダ選択がサポートされていません。Chrome/Edgeをお使いください。");
+      return;
+    }
+    try {
+      const dirHandle = await window.showDirectoryPicker({ mode: "read" });
+
+      // Phase 1: Scan for all image files
+      importCancelRef.current = false;
+      setImportProgress({ current: 0, total: 0, file: "フォルダをスキャン中..." });
+
+      const fileEntries = [];
+      for await (const entry of scanDirectory(dirHandle)) {
+        if (importCancelRef.current) break;
+        fileEntries.push(entry);
+        setImportProgress({ current: 0, total: fileEntries.length, file: `スキャン中... ${entry.path}` });
+      }
+
+      if (importCancelRef.current || fileEntries.length === 0) {
+        setImportProgress(null);
+        if (fileEntries.length === 0) showToast("画像ファイルが見つかりませんでした");
+        return;
+      }
+
+      // Phase 2: Process files with progress
+      const total = fileEntries.length;
+      setImportProgress({ current: 0, total, file: "" });
+
+      const batch = [];
+      for (let i = 0; i < total; i++) {
+        if (importCancelRef.current) break;
+        const { file, path } = fileEntries[i];
+        setImportProgress({ current: i + 1, total, file: path });
+
+        const photo = await processImageFile(file);
+        if (photo) {
+          photo.folderPath = path;
+          batch.push(photo);
+        }
+
+        // Commit in batches of 30
+        if (batch.length >= 30 || i === total - 1) {
+          const toAdd = batch.splice(0, batch.length);
+          setPhotos((prev) => {
+            const u = [...prev, ...toAdd];
+            if (!selectedId && u.length > 0) setSelectedId(u[0].id);
+            savePhotos(u);
+            return u;
+          });
+          // Yield to UI
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      }
+
+      setImportProgress(null);
+      showToast(`${dirHandle.name} から ${total} 枚スキャン完了`);
+    } catch (e) {
+      setImportProgress(null);
+      if (e.name !== "AbortError") {
+        console.error("Folder import error:", e);
+        showToast("フォルダの読み込みに失敗しました");
+      }
+    }
+  }, [selectedId, showToast, savePhotos, processImageFile]);
 
   const updatePhoto = useCallback((id, updates) => {
     setPhotos((prev) => { const u = prev.map((p) => (p.id === id ? { ...p, ...updates } : p)); savePhotos(u); return u; });
@@ -691,8 +875,9 @@ export default function PhotoStudio() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: -0.5, color: "#fff" }}><span style={{ color: C.accent }}>◉</span> Photo Studio</span>
           <div style={{ width: 1, height: 20, background: "#333" }} />
-          <input type="file" ref={fileInputRef} multiple accept="image/*" style={{ display: "none" }} onChange={(e) => importFiles(e.target.files)} />
+          <input type="file" ref={fileInputRef} multiple accept="image/*,.heic,.heif" style={{ display: "none" }} onChange={(e) => importFiles(e.target.files)} />
           <button onClick={() => fileInputRef.current?.click()} style={btn(C)}>+ インポート</button>
+          <button onClick={importFolder} style={{ ...btn(C), fontSize: 11 }}>📁 フォルダ</button>
         </div>
         <div style={{ display: "flex", gap: 2 }}>
           {["library", "develop"].map((m) => <button key={m} onClick={() => setMode(m)} style={{ ...btn(C), background: mode === m ? C.accent : "transparent", color: mode === m ? "#111" : C.textDim, fontWeight: mode === m ? 600 : 400 }}>{m === "library" ? "ライブラリ" : "現像"}</button>)}
@@ -934,11 +1119,12 @@ export default function PhotoStudio() {
         </div>
         <div style={{ fontSize: 10, color: C.textDim }}>
           {mode === "develop" && zoom !== 1 && `${Math.round(zoom * 100)}% | `}
-          {dbLoaded ? "💾 自動保存" : "読込中..."} | {filteredPhotos.length}/{photos.length} 枚
+          {dbLoaded ? "💾 自動保存" : "読込中..."} | HEIC対応 | {filteredPhotos.length}/{photos.length} 枚
         </div>
       </div>
 
       {/* Dialogs */}
+      {importProgress && <ImportProgress current={importProgress.current} total={importProgress.total} currentFile={importProgress.file} onCancel={() => { importCancelRef.current = true; setImportProgress(null); showToast("インポートをキャンセル"); }} />}
       {showExportDialog && selected && <ExportDialog photo={selected} batchCount={batchExport ? multiSelect.size : 0} onExport={exportPhoto} onClose={() => { setShowExportDialog(false); setBatchExport(false); }} />}
       {showCollectionDialog && <CollectionDialog collections={collections} onAdd={addCollection} onClose={() => setShowCollectionDialog(false)} />}
 
