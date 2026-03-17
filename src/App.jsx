@@ -1088,6 +1088,69 @@ export default function PhotoStudio() {
     else showToast(`${pairs.length} 組の重複候補を検出`);
   }, [photos, showToast]);
 
+  // ── Cleanup ──
+  const [showCleanup, setShowCleanup] = useState(false);
+
+  const cleanupStats = useMemo(() => {
+    // Detect derivative/preview images by path or naming patterns
+    const derivativePatterns = [/derivatives/i, /resources/i, /thumbnails/i, /previews?/i, /caches?/i, /render/i];
+    const derivativePhotos = photos.filter((p) => {
+      const path = p.folderPath || p.name || "";
+      return derivativePatterns.some((rx) => rx.test(path));
+    });
+
+    // Rejected photos
+    const rejectedPhotos = photos.filter((p) => p.flag === "reject");
+
+    // Unedited photos (no adjustments changed from default)
+    const uneditedRejected = rejectedPhotos.filter((p) =>
+      !Object.keys(DEFAULT_ADJ).some((k) => JSON.stringify(p.adjustments[k]) !== JSON.stringify(DEFAULT_ADJ[k]))
+    );
+
+    // Storage estimate
+    let totalDataSize = 0;
+    let totalThumbSize = 0;
+    photos.forEach((p) => {
+      if (p.dataUrl) totalDataSize += p.dataUrl.length;
+      if (p.thumbUrl) totalThumbSize += p.thumbUrl.length;
+    });
+
+    // Image cache size
+    const cacheCount = Object.keys(imgCache.current).length;
+
+    return {
+      derivativePhotos,
+      derivativeCount: derivativePhotos.length,
+      rejectedPhotos,
+      rejectedCount: rejectedPhotos.length,
+      uneditedRejected,
+      uneditedRejectedCount: uneditedRejected.length,
+      totalDataMB: (totalDataSize / 1024 / 1024).toFixed(1),
+      totalThumbMB: (totalThumbSize / 1024 / 1024).toFixed(1),
+      cacheCount,
+    };
+  }, [photos]);
+
+  const cleanupDerivatives = useCallback(() => {
+    if (cleanupStats.derivativeCount === 0) { showToast("派生画像はありません"); return; }
+    if (!confirm(`${cleanupStats.derivativeCount} 枚の派生画像（サムネイル/プレビュー）を削除しますか？`)) return;
+    deletePhotos(cleanupStats.derivativePhotos.map((p) => p.id));
+    showToast(`${cleanupStats.derivativeCount} 枚の派生画像を削除`);
+  }, [cleanupStats, deletePhotos, showToast]);
+
+  const cleanupRejected = useCallback(() => {
+    if (cleanupStats.rejectedCount === 0) { showToast("不採用写真はありません"); return; }
+    if (!confirm(`${cleanupStats.rejectedCount} 枚の不採用写真を削除しますか？`)) return;
+    deletePhotos(cleanupStats.rejectedPhotos.map((p) => p.id));
+    showToast(`${cleanupStats.rejectedCount} 枚の不採用写真を削除`);
+  }, [cleanupStats, deletePhotos, showToast]);
+
+  const clearImageCache = useCallback(() => {
+    const count = Object.keys(imgCache.current).length;
+    imgCache.current = {};
+    showToast(`画像キャッシュをクリア（${count} 枚）`);
+  }, [showToast]);
+
   // Filtered + sorted
   const filteredPhotos = useMemo(() => {
     let list = photos.filter((p) => {
@@ -1269,12 +1332,40 @@ export default function PhotoStudio() {
             </Section>
             <Section title="ツール" defaultOpen={false}>
               <button onClick={findDuplicates}
-                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc", marginBottom: 6 }}>
                 🔍 重複写真を検出
               </button>
-              <div style={{ fontSize: 9, color: "#555", marginTop: 6, lineHeight: 1.5 }}>
-                類似・重複写真を自動検出し、比較しながら整理できます。
-              </div>
+              <button onClick={() => setShowCleanup(!showCleanup)}
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                🧹 クリーンナップ
+              </button>
+              {showCleanup && (
+                <div style={{ marginTop: 8, background: "#1e1e1e", borderRadius: 6, padding: 10, border: "1px solid #333" }}>
+                  <div style={{ fontSize: 10, color: "#888", marginBottom: 8, lineHeight: 1.6 }}>
+                    ストレージ: 写真 {cleanupStats.totalDataMB} MB / サムネイル {cleanupStats.totalThumbMB} MB<br />
+                    キャッシュ: {cleanupStats.cacheCount} 枚
+                  </div>
+
+                  <button onClick={cleanupDerivatives}
+                    style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "5px 0", fontSize: 10, cursor: "pointer", background: cleanupStats.derivativeCount > 0 ? "#3a2a1a" : "#2a2a2a", color: cleanupStats.derivativeCount > 0 ? "#f59e0b" : "#666", marginBottom: 4 }}>
+                    🗑 派生画像を削除（{cleanupStats.derivativeCount} 枚）
+                  </button>
+
+                  <button onClick={cleanupRejected}
+                    style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "5px 0", fontSize: 10, cursor: "pointer", background: cleanupStats.rejectedCount > 0 ? "#3a2020" : "#2a2a2a", color: cleanupStats.rejectedCount > 0 ? "#f87171" : "#666", marginBottom: 4 }}>
+                    🗑 不採用写真を削除（{cleanupStats.rejectedCount} 枚）
+                  </button>
+
+                  <button onClick={clearImageCache}
+                    style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "5px 0", fontSize: 10, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                    🔄 画像キャッシュをクリア
+                  </button>
+
+                  <div style={{ fontSize: 9, color: "#555", marginTop: 6, lineHeight: 1.5 }}>
+                    派生画像: サムネイル/プレビュー等のパスを含む写真を検出・削除。不採用写真: ✕フラグが付いた写真を一括削除。キャッシュクリア: メモリ上の画像データを解放。
+                  </div>
+                </div>
+              )}
             </Section>
           </div>
         )}
