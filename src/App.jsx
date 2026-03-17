@@ -1189,8 +1189,8 @@ export default function PhotoStudio() {
             <button onClick={() => { if (confirm(`${multiSelect.size} 枚を削除しますか？`)) deletePhotos([...multiSelect]); }} style={{ ...btn(C), fontSize: 11, color: C.reject }}>削除</button>
             <button onClick={() => setMultiSelect(new Set())} style={{ ...btn(C), fontSize: 11 }}>解除</button>
           </>)}
-          {mode === "library" && multiSelect.size === 0 && photos.length >= 2 && (
-            <button onClick={findDuplicates} style={{ ...btn(C), fontSize: 11 }}>🔍 重複検出</button>
+          {mode === "library" && multiSelect.size === 0 && (
+            <span></span>
           )}
           {mode === "develop" && zoom !== 1 && <span style={{ fontSize: 10, color: C.accent }}>{Math.round(zoom * 100)}%</span>}
           <span style={{ fontSize: 10, color: C.textDim }}>{filteredPhotos.length}/{photos.length} 枚</span>
@@ -1254,8 +1254,12 @@ export default function PhotoStudio() {
               <input type="file" ref={backupInputRef} accept=".json" style={{ display: "none" }}
                 onChange={(e) => { if (e.target.files[0]) restoreCatalog(e.target.files[0]); e.target.value = ""; }} />
               <button onClick={() => backupInputRef.current?.click()}
-                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc", marginBottom: 6 }}>
                 📂 バックアップから復元
+              </button>
+              <button onClick={findDuplicates}
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                🔍 重複写真を検出
               </button>
               <div style={{ fontSize: 9, color: "#555", marginTop: 6, lineHeight: 1.5 }}>
                 写真・編集設定・プリセット・コレクションをJSONファイルに保存/復元します。復元時は重複を自動スキップします。
