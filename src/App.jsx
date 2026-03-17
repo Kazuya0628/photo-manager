@@ -129,6 +129,8 @@ async function convertHEICtoJPEG(file) {
 }
 
 async function* scanDirectory(dirHandle, path = "") {
+  // Skip macOS Photos Library derivative/cache folders
+  const SKIP_DIRS = new Set(["derivatives", "resources", "database", "scopes", "syndication", ".thumbnails"]);
   for await (const entry of dirHandle.values()) {
     if (entry.kind === "file") {
       if (IMAGE_EXTS.test(entry.name)) {
@@ -137,7 +139,7 @@ async function* scanDirectory(dirHandle, path = "") {
           yield { file, path: path ? `${path}/${entry.name}` : entry.name };
         } catch (e) { /* skip inaccessible files */ }
       }
-    } else if (entry.kind === "directory" && !entry.name.startsWith(".")) {
+    } else if (entry.kind === "directory" && !entry.name.startsWith(".") && !SKIP_DIRS.has(entry.name.toLowerCase())) {
       yield* scanDirectory(entry, path ? `${path}/${entry.name}` : entry.name);
     }
   }
@@ -727,17 +729,19 @@ export default function PhotoStudio() {
     importCancelRef.current = false;
     setImportProgress({ current: 0, total: allFiles.length, file: "" });
 
+    // Build fingerprint set from ALL existing photos (snapshot)
+    const existingFps = new Set();
+    setPhotos((cur) => { cur.forEach((p) => { if (p.fingerprint) existingFps.add(p.fingerprint); }); return cur; });
+
     let added = 0, skipped = 0;
     const newPhotos = [];
     for (let i = 0; i < allFiles.length; i++) {
       if (importCancelRef.current) break;
-      setImportProgress({ current: i, total: allFiles.length, file: allFiles[i].name });
+      setImportProgress({ current: i + 1, total: allFiles.length, file: allFiles[i].name });
       const photo = await processImageFile(allFiles[i]);
       if (photo) {
-        // Dedup check
-        const isDup = photos.some((p) => p.fingerprint && p.fingerprint === photo.fingerprint) ||
-                      newPhotos.some((p) => p.fingerprint === photo.fingerprint);
-        if (isDup) { skipped++; continue; }
+        if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
+        existingFps.add(photo.fingerprint);
         newPhotos.push(photo);
         added++;
       }
@@ -754,7 +758,7 @@ export default function PhotoStudio() {
     setImportProgress(null);
     const msg = skipped > 0 ? `${added} 枚インポート（${skipped} 枚は重複スキップ）` : `${added} 枚インポート完了`;
     showToast(msg);
-  }, [selectedId, showToast, savePhotos, processImageFile, photos]);
+  }, [selectedId, showToast, savePhotos, processImageFile]);
 
   // Folder import via File System Access API
   const importFolder = useCallback(async () => {
@@ -786,6 +790,10 @@ export default function PhotoStudio() {
       const total = fileEntries.length;
       setImportProgress({ current: 0, total, file: "" });
 
+      // Build fingerprint set from ALL existing photos (snapshot)
+      const existingFps = new Set();
+      setPhotos((cur) => { cur.forEach((p) => { if (p.fingerprint) existingFps.add(p.fingerprint); }); return cur; });
+
       let added = 0, skipped = 0;
       const batch = [];
       for (let i = 0; i < total; i++) {
@@ -796,10 +804,8 @@ export default function PhotoStudio() {
         const photo = await processImageFile(file);
         if (photo) {
           photo.folderPath = path;
-          // Dedup check
-          const isDup = photos.some((p) => p.fingerprint && p.fingerprint === photo.fingerprint) ||
-                        batch.some((p) => p.fingerprint === photo.fingerprint);
-          if (isDup) { skipped++; continue; }
+          if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
+          existingFps.add(photo.fingerprint);
           batch.push(photo);
           added++;
         }
