@@ -452,6 +452,114 @@ function CollectionDialog({ collections, onAdd, onClose }) {
   </div>);
 }
 
+// ── Perceptual image hash (for similarity detection) ──
+function getImageHash(thumbUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const sz = 8;
+      const c = document.createElement("canvas");
+      c.width = sz; c.height = sz;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, sz, sz);
+      const d = ctx.getImageData(0, 0, sz, sz).data;
+      // Convert to grayscale values
+      const grays = [];
+      for (let i = 0; i < d.length; i += 4) grays.push(0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2]);
+      const avg = grays.reduce((a, b) => a + b, 0) / grays.length;
+      // Generate 64-bit hash as hex string
+      let hash = "";
+      for (let i = 0; i < grays.length; i++) hash += grays[i] >= avg ? "1" : "0";
+      resolve(hash);
+    };
+    img.onerror = () => resolve(null);
+    img.src = thumbUrl;
+  });
+}
+
+function hammingDistance(a, b) {
+  if (!a || !b || a.length !== b.length) return 64;
+  let dist = 0;
+  for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) dist++;
+  return dist;
+}
+
+// ── Duplicate Review Dialog ──
+function DuplicateReview({ pairs, photos, onDelete, onKeepBoth, onClose, onDeleteBoth }) {
+  const [idx, setIdx] = useState(0);
+  if (!pairs.length) return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.7)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100 }}>
+      <div style={{ background: "#2a2a2a", borderRadius: 12, padding: 24, width: 340, border: "1px solid #444", textAlign: "center" }}>
+        <div style={{ fontSize: 48, marginBottom: 12 }}>✅</div>
+        <div style={{ fontSize: 14, fontWeight: 600, color: "#fff", marginBottom: 8 }}>重複写真は見つかりませんでした</div>
+        <button onClick={onClose} style={{ border: "none", borderRadius: 6, padding: "8px 24px", fontSize: 12, cursor: "pointer", background: "#68b5ff", color: "#111", fontWeight: 600 }}>閉じる</button>
+      </div>
+    </div>
+  );
+
+  const pair = pairs[idx];
+  if (!pair) { onClose(); return null; }
+  const a = photos.find((p) => p.id === pair.idA);
+  const b = photos.find((p) => p.id === pair.idB);
+  if (!a || !b) { setIdx((i) => i + 1); return null; }
+
+  const Card = ({ photo, label, onPick }) => (
+    <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", gap: 8, padding: 12 }}>
+      <div style={{ fontSize: 11, color: "#888", fontWeight: 600 }}>{label}</div>
+      <img src={photo.thumbUrl} alt={photo.name} style={{ width: "100%", maxHeight: 220, objectFit: "contain", borderRadius: 6, background: "#111" }} />
+      <div style={{ fontSize: 10, color: "#aaa", textAlign: "center", lineHeight: 1.6, width: "100%" }}>
+        <div style={{ color: "#ccc", fontWeight: 500, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{photo.name}</div>
+        <div>{photo.width}×{photo.height}</div>
+        <div>{(photo.size / 1024 / 1024).toFixed(2)} MB</div>
+        <div>★ {photo.rating} | {photo.flag === "pick" ? "採用" : photo.flag === "reject" ? "不採用" : "—"}</div>
+        {photo.colorLabel && photo.colorLabel !== "none" && <div style={{ marginTop: 2 }}>🏷 {photo.colorLabel}</div>}
+      </div>
+      <button onClick={onPick} style={{ width: "100%", border: "none", borderRadius: 6, padding: "8px 0", fontSize: 12, cursor: "pointer", background: "#22c55e", color: "#111", fontWeight: 600 }}>
+        こちらを残す
+      </button>
+    </div>
+  );
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.8)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1100 }}>
+      <div style={{ background: "#222", borderRadius: 12, padding: 20, width: 640, maxWidth: "95vw", border: "1px solid #444" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
+          <span style={{ fontSize: 14, fontWeight: 600, color: "#fff" }}>
+            重複写真の比較 ({idx + 1} / {pairs.length})
+          </span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 10, color: "#888" }}>
+              類似度: {pair.matchType === "exact" ? "完全一致" : `${Math.round((1 - pair.distance / 64) * 100)}%`}
+            </span>
+            <button onClick={onClose} style={{ border: "none", background: "transparent", color: "#888", fontSize: 18, cursor: "pointer" }}>×</button>
+          </div>
+        </div>
+
+        <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+          <Card photo={a} label="A" onPick={() => { onDelete(b.id); setIdx((i) => i + 1); }} />
+          <div style={{ width: 1, background: "#444", alignSelf: "stretch" }} />
+          <Card photo={b} label="B" onPick={() => { onDelete(a.id); setIdx((i) => i + 1); }} />
+        </div>
+
+        <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={() => { onKeepBoth(); setIdx((i) => i + 1); }}
+            style={{ flex: 1, border: "1px solid #555", borderRadius: 6, padding: "8px 0", fontSize: 11, cursor: "pointer", background: "#333", color: "#ccc" }}>
+            両方残す
+          </button>
+          <button onClick={() => { onDeleteBoth(a.id, b.id); setIdx((i) => i + 1); }}
+            style={{ flex: 1, border: "1px solid #552020", borderRadius: 6, padding: "8px 0", fontSize: 11, cursor: "pointer", background: "#2a1a1a", color: "#f87171" }}>
+            両方削除
+          </button>
+          <button onClick={() => setIdx((i) => i + 1)}
+            style={{ flex: 1, border: "1px solid #555", borderRadius: 6, padding: "8px 0", fontSize: 11, cursor: "pointer", background: "#333", color: "#ccc" }}>
+            スキップ →
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ═══ Main App ═══
 export default function PhotoStudio() {
   const [photos, setPhotos] = useState([]);
@@ -482,6 +590,7 @@ export default function PhotoStudio() {
   const [dbLoaded, setDbLoaded] = useState(false);
   const [importProgress, setImportProgress] = useState(null); // { current, total, file }
   const importCancelRef = useRef(false);
+  const [dupPairs, setDupPairs] = useState(null); // null = hidden, [] = no dups
 
   const canvasRef = useRef(null);
   const beforeCanvasRef = useRef(null);
@@ -921,6 +1030,58 @@ export default function PhotoStudio() {
     }
   }, [photos, presets, collections, savePhotos, savePresets, saveCollections, showToast]);
 
+  // ── Find Duplicates ──
+  const findDuplicates = useCallback(async () => {
+    if (photos.length < 2) { showToast("写真が2枚以上必要です"); return; }
+
+    setImportProgress({ current: 0, total: photos.length, file: "画像ハッシュを計算中..." });
+    const hashes = new Map();
+
+    // Compute perceptual hashes
+    for (let i = 0; i < photos.length; i++) {
+      setImportProgress({ current: i + 1, total: photos.length, file: photos[i].name });
+      const hash = await getImageHash(photos[i].thumbUrl);
+      hashes.set(photos[i].id, hash);
+      if (i % 10 === 0) await new Promise((r) => setTimeout(r, 5));
+    }
+
+    setImportProgress({ current: 0, total: 0, file: "重複ペアを検索中..." });
+
+    const pairs = [];
+    const seen = new Set();
+
+    for (let i = 0; i < photos.length; i++) {
+      for (let j = i + 1; j < photos.length; j++) {
+        const a = photos[i], b = photos[j];
+        const pairKey = `${a.id}|${b.id}`;
+        if (seen.has(pairKey)) continue;
+
+        // Exact fingerprint match
+        if (a.fingerprint && b.fingerprint && a.fingerprint === b.fingerprint) {
+          pairs.push({ idA: a.id, idB: b.id, matchType: "exact", distance: 0 });
+          seen.add(pairKey);
+          continue;
+        }
+
+        // Perceptual hash similarity
+        const hA = hashes.get(a.id), hB = hashes.get(b.id);
+        const dist = hammingDistance(hA, hB);
+        if (dist <= 10) { // threshold: <=10 out of 64 bits = ~84% similar
+          pairs.push({ idA: a.id, idB: b.id, matchType: "similar", distance: dist });
+          seen.add(pairKey);
+        }
+      }
+    }
+
+    // Sort: exact matches first, then by distance
+    pairs.sort((a, b) => a.distance - b.distance);
+
+    setImportProgress(null);
+    setDupPairs(pairs);
+    if (pairs.length === 0) showToast("重複写真は見つかりませんでした");
+    else showToast(`${pairs.length} 組の重複候補を検出`);
+  }, [photos, showToast]);
+
   // Filtered + sorted
   const filteredPhotos = useMemo(() => {
     let list = photos.filter((p) => {
@@ -1028,6 +1189,9 @@ export default function PhotoStudio() {
             <button onClick={() => { if (confirm(`${multiSelect.size} 枚を削除しますか？`)) deletePhotos([...multiSelect]); }} style={{ ...btn(C), fontSize: 11, color: C.reject }}>削除</button>
             <button onClick={() => setMultiSelect(new Set())} style={{ ...btn(C), fontSize: 11 }}>解除</button>
           </>)}
+          {mode === "library" && multiSelect.size === 0 && photos.length >= 2 && (
+            <button onClick={findDuplicates} style={{ ...btn(C), fontSize: 11 }}>🔍 重複検出</button>
+          )}
           {mode === "develop" && zoom !== 1 && <span style={{ fontSize: 10, color: C.accent }}>{Math.round(zoom * 100)}%</span>}
           <span style={{ fontSize: 10, color: C.textDim }}>{filteredPhotos.length}/{photos.length} 枚</span>
         </div>
@@ -1269,6 +1433,13 @@ export default function PhotoStudio() {
       {importProgress && <ImportProgress current={importProgress.current} total={importProgress.total} currentFile={importProgress.file} onCancel={() => { importCancelRef.current = true; setImportProgress(null); showToast("インポートをキャンセル"); }} />}
       {showExportDialog && selected && <ExportDialog photo={selected} batchCount={batchExport ? multiSelect.size : 0} onExport={exportPhoto} onClose={() => { setShowExportDialog(false); setBatchExport(false); }} />}
       {showCollectionDialog && <CollectionDialog collections={collections} onAdd={addCollection} onClose={() => setShowCollectionDialog(false)} />}
+      {dupPairs !== null && <DuplicateReview
+        pairs={dupPairs} photos={photos}
+        onDelete={(id) => deletePhotos([id])}
+        onDeleteBoth={(idA, idB) => deletePhotos([idA, idB])}
+        onKeepBoth={() => {}}
+        onClose={() => setDupPairs(null)}
+      />}
 
       {/* Toast */}
       {toast && <div style={{ position: "fixed", bottom: 40, left: "50%", transform: "translateX(-50%)", background: "rgba(0,0,0,0.85)", color: "#fff", fontSize: 12, padding: "8px 20px", borderRadius: 8, zIndex: 1000, pointerEvents: "none" }}>{toast}</div>}
