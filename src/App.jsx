@@ -97,7 +97,51 @@ async function dbClear(store) {
 
 // ── HEIC / File helpers ──
 const IMAGE_EXTS = /\.(jpe?g|png|gif|webp|bmp|tiff?|heic|heif|avif)$/i;
+const VIDEO_EXTS = /\.(mp4|mov|avi|webm|mkv|m4v|3gp|mts|m2ts)$/i;
+const MEDIA_EXTS = /\.(jpe?g|png|gif|webp|bmp|tiff?|heic|heif|avif|mp4|mov|avi|webm|mkv|m4v|3gp|mts|m2ts)$/i;
 const HEIC_EXTS = /\.(heic|heif)$/i;
+const isVideoFile = (name) => VIDEO_EXTS.test(name);
+const isVideoMime = (type) => type?.startsWith("video/");
+
+// Generate thumbnail from video
+function generateVideoThumbnail(file) {
+  return new Promise((resolve) => {
+    const video = document.createElement("video");
+    video.preload = "metadata";
+    video.muted = true;
+    video.playsInline = true;
+    const url = URL.createObjectURL(file);
+    video.src = url;
+
+    video.onloadeddata = () => {
+      // Seek to 1 second or 10% of duration
+      video.currentTime = Math.min(1, video.duration * 0.1);
+    };
+
+    video.onseeked = () => {
+      const tc = document.createElement("canvas");
+      const s = Math.min(300 / video.videoWidth, 300 / video.videoHeight);
+      tc.width = Math.round(video.videoWidth * s);
+      tc.height = Math.round(video.videoHeight * s);
+      tc.getContext("2d").drawImage(video, 0, 0, tc.width, tc.height);
+      const thumbUrl = tc.toDataURL("image/jpeg", 0.7);
+      const duration = video.duration;
+      URL.revokeObjectURL(url);
+      resolve({ thumbUrl, width: video.videoWidth, height: video.videoHeight, duration });
+    };
+
+    video.onerror = () => { URL.revokeObjectURL(url); resolve(null); };
+    // Timeout fallback
+    setTimeout(() => { URL.revokeObjectURL(url); resolve(null); }, 10000);
+  });
+}
+
+function formatDuration(sec) {
+  if (!sec || !isFinite(sec)) return "";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
 
 async function convertHEICtoJPEG(file) {
   // Try native browser decode first (Safari supports HEIC natively)
@@ -133,7 +177,7 @@ async function* scanDirectory(dirHandle, path = "") {
   const SKIP_DIRS = new Set(["derivatives", "resources", "database", "scopes", "syndication", ".thumbnails"]);
   for await (const entry of dirHandle.values()) {
     if (entry.kind === "file") {
-      if (IMAGE_EXTS.test(entry.name)) {
+      if (MEDIA_EXTS.test(entry.name)) {
         try {
           const file = await entry.getFile();
           yield { file, path: path ? `${path}/${entry.name}` : entry.name };
@@ -679,7 +723,9 @@ export default function PhotoStudio() {
   useEffect(() => {
     if (mode === "develop" && selected) {
       setZoom(1); setPan({ x: 0, y: 0 });
-      renderPreview(selected, showBefore && compareMode === "toggle");
+      if (selected.mediaType !== "video") {
+        renderPreview(selected, showBefore && compareMode === "toggle");
+      }
     }
   }, [mode, selected, showBefore, compareMode, renderPreview]);
 
@@ -721,9 +767,45 @@ export default function PhotoStudio() {
     });
   }, [activeCollection]);
 
+  // Process video file
+  const processVideoFile = useCallback(async (file) => {
+    const result = await generateVideoThumbnail(file);
+    if (!result) return null;
+
+    const dataUrl = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onload = (e) => resolve(e.target.result);
+      reader.onerror = () => resolve(null);
+      reader.readAsDataURL(file);
+    });
+    if (!dataUrl) return null;
+
+    return {
+      id: uid(), name: file.name, size: file.size,
+      width: result.width, height: result.height,
+      fingerprint: makeFingerprint(file.name, file.size, result.width, result.height),
+      dataUrl, thumbUrl: result.thumbUrl,
+      mediaType: "video", duration: result.duration,
+      rating: 0, flag: "none", colorLabel: "none", tags: [],
+      collectionIds: activeCollection ? [activeCollection] : [],
+      adjustments: deepClone(DEFAULT_ADJ), importedAt: Date.now(),
+    };
+  }, [activeCollection]);
+
+  // Unified media file processor
+  const processMediaFile = useCallback(async (file) => {
+    if (isVideoFile(file.name) || isVideoMime(file.type)) {
+      return processVideoFile(file);
+    }
+    return processImageFile(file);
+  }, [processImageFile, processVideoFile]);
+
   // Import from file list (drag & drop or file picker)
   const importFiles = useCallback(async (files) => {
-    const allFiles = Array.from(files).filter((f) => f.type.startsWith("image/") || HEIC_EXTS.test(f.name) || IMAGE_EXTS.test(f.name));
+    const allFiles = Array.from(files).filter((f) =>
+      f.type.startsWith("image/") || f.type.startsWith("video/") ||
+      HEIC_EXTS.test(f.name) || MEDIA_EXTS.test(f.name)
+    );
     if (!allFiles.length) return;
 
     importCancelRef.current = false;
@@ -738,7 +820,7 @@ export default function PhotoStudio() {
     for (let i = 0; i < allFiles.length; i++) {
       if (importCancelRef.current) break;
       setImportProgress({ current: i + 1, total: allFiles.length, file: allFiles[i].name });
-      const photo = await processImageFile(allFiles[i]);
+      const photo = await processMediaFile(allFiles[i]);
       if (photo) {
         if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
         existingFps.add(photo.fingerprint);
@@ -758,7 +840,7 @@ export default function PhotoStudio() {
     setImportProgress(null);
     const msg = skipped > 0 ? `${added} 枚インポート（${skipped} 枚は重複スキップ）` : `${added} 枚インポート完了`;
     showToast(msg);
-  }, [selectedId, showToast, savePhotos, processImageFile]);
+  }, [selectedId, showToast, savePhotos, processMediaFile]);
 
   // Folder import via File System Access API
   const importFolder = useCallback(async () => {
@@ -801,7 +883,7 @@ export default function PhotoStudio() {
         const { file, path } = fileEntries[i];
         setImportProgress({ current: i + 1, total, file: path });
 
-        const photo = await processImageFile(file);
+        const photo = await processMediaFile(file);
         if (photo) {
           photo.folderPath = path;
           if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
@@ -834,7 +916,7 @@ export default function PhotoStudio() {
         showToast("フォルダの読み込みに失敗しました");
       }
     }
-  }, [selectedId, showToast, savePhotos, processImageFile]);
+  }, [selectedId, showToast, savePhotos, processMediaFile]);
 
   const updatePhoto = useCallback((id, updates) => {
     setPhotos((prev) => { const u = prev.map((p) => (p.id === id ? { ...p, ...updates } : p)); savePhotos(u); return u; });
@@ -1232,7 +1314,7 @@ export default function PhotoStudio() {
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
           <span style={{ fontSize: 14, fontWeight: 700, letterSpacing: -0.5, color: "#fff" }}><span style={{ color: C.accent }}>◉</span> Photo Studio</span>
           <div style={{ width: 1, height: 20, background: "#333" }} />
-          <input type="file" ref={fileInputRef} multiple accept="image/*,.heic,.heif" style={{ display: "none" }} onChange={(e) => importFiles(e.target.files)} />
+          <input type="file" ref={fileInputRef} multiple accept="image/*,video/*,.heic,.heif,.mov" style={{ display: "none" }} onChange={(e) => importFiles(e.target.files)} />
           <button onClick={() => fileInputRef.current?.click()} style={btn(C)}>+ インポート</button>
           <button onClick={importFolder} style={{ ...btn(C), fontSize: 11 }}>📁 フォルダ</button>
         </div>
@@ -1392,6 +1474,16 @@ export default function PhotoStudio() {
                       {cl && cl.key !== "none" && <div style={{ position: "absolute", top: 6, left: photo.flag !== "none" ? 22 : 6, width: 10, height: 10, borderRadius: "50%", background: cl.color }} />}
                       {isM && <div style={{ position: "absolute", top: 6, right: 6, width: 16, height: 16, borderRadius: "50%", background: "#f59e0b", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#111", fontWeight: 700 }}>✓</div>}
                       {edited && !isM && <div style={{ position: "absolute", top: 6, right: 6, fontSize: 9, background: "rgba(0,0,0,0.6)", color: C.accent, padding: "1px 5px", borderRadius: 3 }}>編集済</div>}
+                      {photo.mediaType === "video" && (
+                        <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%,-50%)", width: 36, height: 36, borderRadius: "50%", background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", pointerEvents: "none" }}>
+                          <div style={{ width: 0, height: 0, borderTop: "8px solid transparent", borderBottom: "8px solid transparent", borderLeft: "14px solid #fff", marginLeft: 3 }} />
+                        </div>
+                      )}
+                      {photo.mediaType === "video" && photo.duration && (
+                        <div style={{ position: "absolute", bottom: 32, right: 6, fontSize: 9, background: "rgba(0,0,0,0.7)", color: "#fff", padding: "1px 5px", borderRadius: 3, fontVariantNumeric: "tabular-nums" }}>
+                          {formatDuration(photo.duration)}
+                        </div>
+                      )}
                       <div style={{ padding: "5px 6px", background: "rgba(0,0,0,0.7)" }}>
                         <div style={{ fontSize: 10, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginBottom: 2, color: "#bbb" }}>{photo.name}</div>
                         <StarRating value={photo.rating} onChange={(r) => updatePhoto(photo.id, { rating: r })} size={11} />
@@ -1404,7 +1496,17 @@ export default function PhotoStudio() {
           ) : (
             <div style={{ flex: 1, display: "flex", background: "#111", position: "relative", overflow: "hidden" }} onWheel={onWheel}>
               {selected ? (
-                compareMode === "side" && showBefore ? (
+                selected.mediaType === "video" ? (
+                  // Video player
+                  <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                    <video
+                      src={selected.dataUrl}
+                      controls
+                      autoPlay={false}
+                      style={{ maxWidth: "90%", maxHeight: "90%", borderRadius: 8, background: "#000" }}
+                    />
+                  </div>
+                ) : compareMode === "side" && showBefore ? (
                   // Side-by-side
                   <div style={{ display: "flex", flex: 1, alignItems: "center", justifyContent: "center", gap: 4 }}>
                     <div style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center" }}>
@@ -1526,7 +1628,7 @@ export default function PhotoStudio() {
       {/* Status bar */}
       <div style={{ height: 24, background: C.toolbar, borderTop: `1px solid ${C.panelBorder}`, display: "flex", alignItems: "center", padding: "0 16px", justifyContent: "space-between", flexShrink: 0 }}>
         <div style={{ fontSize: 10, color: C.textDim }}>
-          {selected ? `${selected.name} | ${selected.width}×${selected.height} | ${(selected.size / 1024 / 1024).toFixed(1)}MB` : "写真を選択してください"}
+          {selected ? `${selected.name} | ${selected.width}×${selected.height} | ${(selected.size / 1024 / 1024).toFixed(1)}MB${selected.mediaType === "video" ? ` | 🎬 ${formatDuration(selected.duration)}` : ""}` : "写真を選択してください"}
           {activeCollection && ` | 📁 ${collections.find((c) => c.id === activeCollection)?.name || ""}`}
         </div>
         <div style={{ fontSize: 10, color: C.textDim }}>
