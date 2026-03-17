@@ -9,6 +9,7 @@ const clamp = (v, lo, hi) => Math.min(Math.max(v, lo), hi);
 const uid = () => crypto.randomUUID?.() || Math.random().toString(36).slice(2);
 const lerp = (a, b, t) => a + (b - a) * t;
 const deepClone = (o) => JSON.parse(JSON.stringify(o));
+const makeFingerprint = (name, size, w, h) => `${name}|${size}|${w}x${h}`;
 
 // ── Defaults ──
 const DEFAULT_CURVE = [{ x: 0, y: 0 }, { x: 0.25, y: 0.25 }, { x: 0.75, y: 0.75 }, { x: 1, y: 1 }];
@@ -594,6 +595,7 @@ export default function PhotoStudio() {
           tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
           resolve({
             id: uid(), name: file.name, size: file.size, width: img.width, height: img.height,
+            fingerprint: makeFingerprint(file.name, file.size, img.width, img.height),
             dataUrl: e.target.result, thumbUrl: tc.toDataURL("image/jpeg", 0.7),
             rating: 0, flag: "none", colorLabel: "none", tags: [],
             collectionIds: activeCollection ? [activeCollection] : [],
@@ -616,13 +618,20 @@ export default function PhotoStudio() {
     importCancelRef.current = false;
     setImportProgress({ current: 0, total: allFiles.length, file: "" });
 
+    let added = 0, skipped = 0;
     const newPhotos = [];
     for (let i = 0; i < allFiles.length; i++) {
       if (importCancelRef.current) break;
       setImportProgress({ current: i, total: allFiles.length, file: allFiles[i].name });
       const photo = await processImageFile(allFiles[i]);
-      if (photo) newPhotos.push(photo);
-      // Add in batches of 20 to show progress in UI
+      if (photo) {
+        // Dedup check
+        const isDup = photos.some((p) => p.fingerprint && p.fingerprint === photo.fingerprint) ||
+                      newPhotos.some((p) => p.fingerprint === photo.fingerprint);
+        if (isDup) { skipped++; continue; }
+        newPhotos.push(photo);
+        added++;
+      }
       if (newPhotos.length > 0 && (newPhotos.length % 20 === 0 || i === allFiles.length - 1)) {
         const batch = newPhotos.splice(0, newPhotos.length);
         setPhotos((prev) => {
@@ -634,8 +643,9 @@ export default function PhotoStudio() {
       }
     }
     setImportProgress(null);
-    showToast(`${allFiles.length} 枚インポート完了`);
-  }, [selectedId, showToast, savePhotos, processImageFile]);
+    const msg = skipped > 0 ? `${added} 枚インポート（${skipped} 枚は重複スキップ）` : `${added} 枚インポート完了`;
+    showToast(msg);
+  }, [selectedId, showToast, savePhotos, processImageFile, photos]);
 
   // Folder import via File System Access API
   const importFolder = useCallback(async () => {
@@ -667,6 +677,7 @@ export default function PhotoStudio() {
       const total = fileEntries.length;
       setImportProgress({ current: 0, total, file: "" });
 
+      let added = 0, skipped = 0;
       const batch = [];
       for (let i = 0; i < total; i++) {
         if (importCancelRef.current) break;
@@ -676,7 +687,12 @@ export default function PhotoStudio() {
         const photo = await processImageFile(file);
         if (photo) {
           photo.folderPath = path;
+          // Dedup check
+          const isDup = photos.some((p) => p.fingerprint && p.fingerprint === photo.fingerprint) ||
+                        batch.some((p) => p.fingerprint === photo.fingerprint);
+          if (isDup) { skipped++; continue; }
           batch.push(photo);
+          added++;
         }
 
         // Commit in batches of 30
@@ -694,7 +710,8 @@ export default function PhotoStudio() {
       }
 
       setImportProgress(null);
-      showToast(`${dirHandle.name} から ${total} 枚スキャン完了`);
+      const msg = skipped > 0 ? `${added} 枚インポート（${skipped} 枚は重複スキップ）` : `${dirHandle.name} から ${added} 枚インポート完了`;
+      showToast(msg);
     } catch (e) {
       setImportProgress(null);
       if (e.name !== "AbortError") {
@@ -793,6 +810,116 @@ export default function PhotoStudio() {
     });
     showToast(`${ids.length} 枚をコレクションに追加`);
   }, [multiSelect, selected, savePhotos, showToast]);
+
+  // ── Backup / Restore ──
+  const backupInputRef = useRef(null);
+
+  const backupCatalog = useCallback(() => {
+    const catalog = {
+      version: "1.0.0",
+      exportedAt: new Date().toISOString(),
+      photoCount: photos.length,
+      photos,
+      presets,
+      collections,
+    };
+    const json = JSON.stringify(catalog);
+    const blob = new Blob([json], { type: "application/json" });
+    const sizeMB = (blob.size / 1024 / 1024).toFixed(1);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `photo-studio-backup_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    showToast(`バックアップ完了（${sizeMB} MB / ${photos.length} 枚）`);
+  }, [photos, presets, collections, showToast]);
+
+  const restoreCatalog = useCallback(async (file) => {
+    try {
+      const text = await file.text();
+      const catalog = JSON.parse(text);
+
+      if (!catalog.photos || !Array.isArray(catalog.photos)) {
+        showToast("無効なバックアップファイルです");
+        return;
+      }
+
+      const mode = await new Promise((resolve) => {
+        const choice = confirm(
+          `バックアップを復元します:\n` +
+          `・写真: ${catalog.photos.length} 枚\n` +
+          `・プリセット: ${(catalog.presets || []).length} 個\n` +
+          `・コレクション: ${(catalog.collections || []).length} 個\n` +
+          `・日時: ${catalog.exportedAt || "不明"}\n\n` +
+          `OK = 既存データとマージ（重複スキップ）\n` +
+          `キャンセル = 中止`
+        );
+        resolve(choice ? "merge" : null);
+      });
+
+      if (!mode) return;
+
+      importCancelRef.current = false;
+      setImportProgress({ current: 0, total: catalog.photos.length, file: "復元中..." });
+
+      // Merge photos with dedup
+      let added = 0, skipped = 0;
+      const existingFps = new Set(photos.map((p) => p.fingerprint).filter(Boolean));
+      const batch = [];
+
+      for (let i = 0; i < catalog.photos.length; i++) {
+        if (importCancelRef.current) break;
+        setImportProgress({ current: i + 1, total: catalog.photos.length, file: catalog.photos[i].name || "" });
+
+        const p = catalog.photos[i];
+        // Generate fingerprint if missing
+        if (!p.fingerprint) p.fingerprint = makeFingerprint(p.name, p.size, p.width, p.height);
+
+        if (existingFps.has(p.fingerprint)) { skipped++; continue; }
+        existingFps.add(p.fingerprint);
+        batch.push(p);
+        added++;
+
+        if (batch.length >= 30 || i === catalog.photos.length - 1) {
+          const toAdd = batch.splice(0, batch.length);
+          setPhotos((prev) => { const u = [...prev, ...toAdd]; savePhotos(u); return u; });
+          await new Promise((r) => setTimeout(r, 10));
+        }
+      }
+
+      // Merge presets (by name dedup)
+      if (catalog.presets?.length > 0) {
+        const existingNames = new Set(presets.map((p) => p.name));
+        const newPresets = catalog.presets.filter((p) => !existingNames.has(p.name));
+        if (newPresets.length > 0) {
+          const merged = [...presets, ...newPresets];
+          setPresets(merged);
+          savePresets(merged);
+        }
+      }
+
+      // Merge collections (by name dedup)
+      if (catalog.collections?.length > 0) {
+        const existingNames = new Set(collections.map((c) => c.name));
+        const newColls = catalog.collections.filter((c) => !existingNames.has(c.name));
+        if (newColls.length > 0) {
+          const merged = [...collections, ...newColls];
+          setCollections(merged);
+          saveCollections(merged);
+        }
+      }
+
+      setImportProgress(null);
+      const msg = skipped > 0
+        ? `復元完了: ${added} 枚追加（${skipped} 枚は重複スキップ）`
+        : `復元完了: ${added} 枚追加`;
+      showToast(msg);
+    } catch (e) {
+      setImportProgress(null);
+      console.error("Restore failed:", e);
+      showToast("バックアップの読み込みに失敗しました");
+    }
+  }, [photos, presets, collections, savePhotos, savePresets, saveCollections, showToast]);
 
   // Filtered + sorted
   const filteredPhotos = useMemo(() => {
@@ -953,6 +1080,21 @@ export default function PhotoStudio() {
               <div style={{ display: "flex", gap: 3 }}>
                 <button onClick={() => setFilterColor("all")} style={{ ...btn(C), padding: "2px 6px", fontSize: 10, background: filterColor === "all" ? C.accent : "#333", color: filterColor === "all" ? "#111" : C.textDim }}>全て</button>
                 {COLOR_LABELS.slice(1).map((cl) => <button key={cl.key} onClick={() => setFilterColor(cl.key)} style={{ width: 18, height: 18, borderRadius: "50%", border: filterColor === cl.key ? "2px solid #fff" : "2px solid transparent", background: cl.color, cursor: "pointer", padding: 0 }} />)}
+              </div>
+            </Section>
+            <Section title="バックアップ" defaultOpen={false}>
+              <button onClick={backupCatalog}
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc", marginBottom: 6 }}>
+                💾 カタログをバックアップ
+              </button>
+              <input type="file" ref={backupInputRef} accept=".json" style={{ display: "none" }}
+                onChange={(e) => { if (e.target.files[0]) restoreCatalog(e.target.files[0]); e.target.value = ""; }} />
+              <button onClick={() => backupInputRef.current?.click()}
+                style={{ width: "100%", border: "1px solid #444", borderRadius: 4, padding: "6px 0", fontSize: 11, cursor: "pointer", background: "#2a2a2a", color: "#ccc" }}>
+                📂 バックアップから復元
+              </button>
+              <div style={{ fontSize: 9, color: "#555", marginTop: 6, lineHeight: 1.5 }}>
+                写真・編集設定・プリセット・コレクションをJSONファイルに保存/復元します。復元時は重複を自動スキップします。
               </div>
             </Section>
           </div>
