@@ -40,7 +40,7 @@ const DEFAULT_ADJ = {
 
 // ═══ IndexedDB Helper ═══
 const DB_NAME = "PhotoStudioDB";
-const DB_VER = 2;
+const DB_VER = 3;
 function openDB() {
   return new Promise((res, rej) => {
     const req = indexedDB.open(DB_NAME, DB_VER);
@@ -50,6 +50,8 @@ function openDB() {
       if (!db.objectStoreNames.contains("presets")) db.createObjectStore("presets", { keyPath: "id" });
       if (!db.objectStoreNames.contains("collections")) db.createObjectStore("collections", { keyPath: "id" });
       if (!db.objectStoreNames.contains("meta")) db.createObjectStore("meta", { keyPath: "key" });
+      // v3: separate blob store for full-resolution image/video data
+      if (!db.objectStoreNames.contains("blobs")) db.createObjectStore("blobs", { keyPath: "id" });
     };
     req.onsuccess = () => res(req.result);
     req.onerror = () => rej(req.error);
@@ -92,6 +94,39 @@ async function dbClear(store) {
     tx.objectStore(store).clear().onsuccess = () => res();
   });
 }
+async function dbGet(store, id) {
+  const db = await openDB();
+  return new Promise((res) => {
+    const tx = db.transaction(store, "readonly");
+    tx.objectStore(store).get(id).onsuccess = (e) => res(e.target.result);
+  });
+}
+// Save blob for a photo (raw file data as Blob)
+async function dbPutBlob(id, blob) {
+  const db = await openDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("blobs", "readwrite");
+    tx.objectStore("blobs").put({ id, blob });
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function dbGetBlob(id) {
+  const db = await openDB();
+  return new Promise((res) => {
+    const tx = db.transaction("blobs", "readonly");
+    tx.objectStore("blobs").get(id).onsuccess = (e) => res(e.target.result?.blob || null);
+  });
+}
+async function dbDeleteBlob(id) {
+  const db = await openDB();
+  return new Promise((res) => {
+    const tx = db.transaction("blobs", "readwrite");
+    tx.objectStore("blobs").delete(id).onsuccess = () => res();
+  });
+}
+// Yield to the browser event loop
+const yieldToUI = () => new Promise((r) => setTimeout(r, 0));
 
 // ═══ Image Processing ═══
 
@@ -642,11 +677,50 @@ export default function PhotoStudio() {
   const beforeCanvasRef = useRef(null);
   const imgCache = useRef({});
   const fileInputRef = useRef(null);
+  const videoBlobUrlRef = useRef(null); // current video blob URL for cleanup
   const history = useHistory();
   const saveTimer = useRef(null);
 
   const selected = useMemo(() => photos.find((p) => p.id === selectedId), [photos, selectedId]);
   const showToast = useCallback((msg) => { setToast(msg); setTimeout(() => setToast(null), 2000); }, []);
+  const [videoBlobUrl, setVideoBlobUrl] = useState(null);
+
+  // Load video blob URL when a video is selected
+  useEffect(() => {
+    if (selected?.mediaType === "video") {
+      let cancelled = false;
+      (async () => {
+        try {
+          const blob = await dbGetBlob(selected.id);
+          if (cancelled) return;
+          if (blob) {
+            const url = URL.createObjectURL(blob);
+            setVideoBlobUrl(url);
+            videoBlobUrlRef.current = url;
+          } else if (selected.dataUrl) {
+            // Legacy fallback
+            setVideoBlobUrl(selected.dataUrl);
+          } else {
+            setVideoBlobUrl(null);
+          }
+        } catch { setVideoBlobUrl(null); }
+      })();
+      return () => {
+        cancelled = true;
+        if (videoBlobUrlRef.current && videoBlobUrlRef.current.startsWith("blob:")) {
+          URL.revokeObjectURL(videoBlobUrlRef.current);
+        }
+        videoBlobUrlRef.current = null;
+        setVideoBlobUrl(null);
+      };
+    } else {
+      if (videoBlobUrlRef.current && videoBlobUrlRef.current.startsWith("blob:")) {
+        URL.revokeObjectURL(videoBlobUrlRef.current);
+      }
+      videoBlobUrlRef.current = null;
+      setVideoBlobUrl(null);
+    }
+  }, [selected?.id, selected?.mediaType]);
 
   // ── IndexedDB Load ──
   useEffect(() => {
@@ -658,6 +732,35 @@ export default function PhotoStudio() {
         if (savedPhotos.length > 0) {
           setPhotos(savedPhotos);
           showToast(`${savedPhotos.length} 枚のカタログを復元`);
+
+          // Background migration: move legacy dataUrl to blob store
+          const toMigrate = savedPhotos.filter((p) => p.dataUrl);
+          if (toMigrate.length > 0) {
+            (async () => {
+              for (const p of toMigrate) {
+                try {
+                  const existing = await dbGetBlob(p.id);
+                  if (!existing && p.dataUrl) {
+                    // Convert dataUrl to Blob and store
+                    const resp = await fetch(p.dataUrl);
+                    const blob = await resp.blob();
+                    await dbPutBlob(p.id, blob);
+                  }
+                } catch (e) { console.warn("Migration failed for", p.name, e); }
+                await yieldToUI();
+              }
+              // After migration, re-save photos without dataUrl
+              setPhotos((cur) => {
+                const cleaned = cur.map((p) => {
+                  if (p.dataUrl) { const { dataUrl, ...rest } = p; return rest; }
+                  return p;
+                });
+                savePhotos(cleaned);
+                return cleaned;
+              });
+              console.log(`Migrated ${toMigrate.length} photos from dataUrl to blob store`);
+            })();
+          }
         }
         if (savedPresets.length > 0) setPresets(savedPresets);
         if (savedCollections.length > 0) setCollections(savedCollections);
@@ -666,11 +769,21 @@ export default function PhotoStudio() {
     })();
   }, []);
 
-  // ── Auto-save to IndexedDB ──
+  // ── Auto-save to IndexedDB (metadata only, blobs stored separately) ──
   const savePhotos = useCallback((updatedPhotos) => {
     clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(async () => {
-      try { await dbPutAll("photos", updatedPhotos); } catch (e) { console.warn("Save failed", e); }
+      try {
+        // Strip dataUrl from photo metadata before saving to keep DB small
+        const toSave = updatedPhotos.map((p) => {
+          if (p.dataUrl) {
+            const { dataUrl, ...rest } = p;
+            return rest;
+          }
+          return p;
+        });
+        await dbPutAll("photos", toSave);
+      } catch (e) { console.warn("Save failed", e); }
     }, 1000);
   }, []);
 
@@ -682,9 +795,27 @@ export default function PhotoStudio() {
     try { await dbClear("collections"); await dbPutAll("collections", c); } catch (e) { console.warn(e); }
   }, []);
 
-  const loadImage = useCallback((photo) => new Promise((resolve) => {
+  const loadImage = useCallback((photo) => new Promise(async (resolve, reject) => {
     if (imgCache.current[photo.id]) return resolve(imgCache.current[photo.id]);
-    const img = new Image(); img.onload = () => { imgCache.current[photo.id] = img; resolve(img); }; img.src = photo.dataUrl;
+    try {
+      // Try blob store first (new format)
+      const blob = await dbGetBlob(photo.id);
+      if (blob) {
+        const url = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => { URL.revokeObjectURL(url); imgCache.current[photo.id] = img; resolve(img); };
+        img.onerror = () => { URL.revokeObjectURL(url); reject(new Error("Image decode failed")); };
+        img.src = url;
+      } else if (photo.dataUrl) {
+        // Fallback for legacy photos that still have dataUrl
+        const img = new Image();
+        img.onload = () => { imgCache.current[photo.id] = img; resolve(img); };
+        img.onerror = () => reject(new Error("Image decode failed"));
+        img.src = photo.dataUrl;
+      } else {
+        reject(new Error("No image data available"));
+      }
+    } catch (e) { reject(e); }
   }), []);
 
   const renderToCanvas = useCallback(async (canvas, photo, useOriginal = false) => {
@@ -729,7 +860,7 @@ export default function PhotoStudio() {
     }
   }, [mode, selected, showBefore, compareMode, renderPreview]);
 
-  // Import single file helper (HEIC aware)
+  // Import single file helper (HEIC aware) — blob-based to avoid memory bloat
   const processImageFile = useCallback(async (file) => {
     let processedFile = file;
     // HEIC conversion
@@ -741,50 +872,47 @@ export default function PhotoStudio() {
     // Check if browser can decode
     if (!processedFile.type.startsWith("image/") && !IMAGE_EXTS.test(processedFile.name)) return null;
 
-    return new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = (e) => {
-        const img = new Image();
-        img.onload = () => {
-          const tc = document.createElement("canvas");
-          const s = Math.min(300 / img.width, 300 / img.height);
-          tc.width = Math.round(img.width * s); tc.height = Math.round(img.height * s);
-          tc.getContext("2d").drawImage(img, 0, 0, tc.width, tc.height);
-          resolve({
-            id: uid(), name: file.name, size: file.size, width: img.width, height: img.height,
-            fingerprint: makeFingerprint(file.name, file.size, img.width, img.height),
-            dataUrl: e.target.result, thumbUrl: tc.toDataURL("image/jpeg", 0.7),
-            rating: 0, flag: "none", colorLabel: "none", tags: [],
-            collectionIds: activeCollection ? [activeCollection] : [],
-            adjustments: deepClone(DEFAULT_ADJ), importedAt: Date.now(),
-          });
-        };
-        img.onerror = () => resolve(null);
-        img.src = e.target.result;
+    try {
+      // Use createImageBitmap + objectURL for thumbnail — no base64 dataUrl in memory
+      const bmp = await createImageBitmap(processedFile);
+      const tc = document.createElement("canvas");
+      const s = Math.min(300 / bmp.width, 300 / bmp.height);
+      tc.width = Math.round(bmp.width * s); tc.height = Math.round(bmp.height * s);
+      tc.getContext("2d").drawImage(bmp, 0, 0, tc.width, tc.height);
+      const thumbUrl = tc.toDataURL("image/jpeg", 0.7);
+      const photoId = uid();
+      const photo = {
+        id: photoId, name: file.name, size: file.size, width: bmp.width, height: bmp.height,
+        fingerprint: makeFingerprint(file.name, file.size, bmp.width, bmp.height),
+        thumbUrl,
+        rating: 0, flag: "none", colorLabel: "none", tags: [],
+        collectionIds: activeCollection ? [activeCollection] : [],
+        adjustments: deepClone(DEFAULT_ADJ), importedAt: Date.now(),
       };
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(processedFile);
-    });
+      bmp.close();
+      // Store the raw file blob in IndexedDB (not in React state)
+      await dbPutBlob(photoId, processedFile);
+      return photo;
+    } catch (e) {
+      console.warn("processImageFile failed:", file.name, e);
+      return null;
+    }
   }, [activeCollection]);
 
-  // Process video file
+  // Process video file — blob-based
   const processVideoFile = useCallback(async (file) => {
     const result = await generateVideoThumbnail(file);
     if (!result) return null;
 
-    const dataUrl = await new Promise((resolve) => {
-      const reader = new FileReader();
-      reader.onload = (e) => resolve(e.target.result);
-      reader.onerror = () => resolve(null);
-      reader.readAsDataURL(file);
-    });
-    if (!dataUrl) return null;
+    const photoId = uid();
+    // Store video blob in IndexedDB (not in React state)
+    await dbPutBlob(photoId, file);
 
     return {
-      id: uid(), name: file.name, size: file.size,
+      id: photoId, name: file.name, size: file.size,
       width: result.width, height: result.height,
       fingerprint: makeFingerprint(file.name, file.size, result.width, result.height),
-      dataUrl, thumbUrl: result.thumbUrl,
+      thumbUrl: result.thumbUrl,
       mediaType: "video", duration: result.duration,
       rating: 0, flag: "none", colorLabel: "none", tags: [],
       collectionIds: activeCollection ? [activeCollection] : [],
@@ -820,14 +948,16 @@ export default function PhotoStudio() {
     for (let i = 0; i < allFiles.length; i++) {
       if (importCancelRef.current) break;
       setImportProgress({ current: i + 1, total: allFiles.length, file: allFiles[i].name });
-      const photo = await processMediaFile(allFiles[i]);
-      if (photo) {
-        if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
-        existingFps.add(photo.fingerprint);
-        newPhotos.push(photo);
-        added++;
-      }
-      if (newPhotos.length > 0 && (newPhotos.length % 20 === 0 || i === allFiles.length - 1)) {
+      try {
+        const photo = await processMediaFile(allFiles[i]);
+        if (photo) {
+          if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
+          existingFps.add(photo.fingerprint);
+          newPhotos.push(photo);
+          added++;
+        }
+      } catch (e) { console.warn("processMediaFile error:", allFiles[i].name, e); }
+      if (newPhotos.length > 0 && (newPhotos.length % 10 === 0 || i === allFiles.length - 1)) {
         const batch = newPhotos.splice(0, newPhotos.length);
         setPhotos((prev) => {
           const u = [...prev, ...batch];
@@ -835,6 +965,8 @@ export default function PhotoStudio() {
           savePhotos(u);
           return u;
         });
+        // Yield to UI so progress bar and React can update
+        await yieldToUI();
       }
     }
     setImportProgress(null);
@@ -842,7 +974,7 @@ export default function PhotoStudio() {
     showToast(msg);
   }, [selectedId, showToast, savePhotos, processMediaFile]);
 
-  // Folder import via File System Access API
+  // Folder import via File System Access API — streaming approach
   const importFolder = useCallback(async () => {
     if (!window.showDirectoryPicker) {
       showToast("このブラウザではフォルダ選択がサポートされていません。Chrome/Edgeをお使いください。");
@@ -851,15 +983,21 @@ export default function PhotoStudio() {
     try {
       const dirHandle = await window.showDirectoryPicker({ mode: "read" });
 
-      // Phase 1: Scan for all image files
+      // Phase 1: Quick scan to count files (lightweight — only paths, no file data)
       importCancelRef.current = false;
       setImportProgress({ current: 0, total: 0, file: "フォルダをスキャン中..." });
 
       const fileEntries = [];
+      let scanCount = 0;
       for await (const entry of scanDirectory(dirHandle)) {
         if (importCancelRef.current) break;
         fileEntries.push(entry);
-        setImportProgress({ current: 0, total: fileEntries.length, file: `スキャン中... ${entry.path}` });
+        scanCount++;
+        // Yield to UI every 50 entries during scan
+        if (scanCount % 50 === 0) {
+          setImportProgress({ current: 0, total: scanCount, file: `スキャン中... ${entry.path}` });
+          await yieldToUI();
+        }
       }
 
       if (importCancelRef.current || fileEntries.length === 0) {
@@ -883,26 +1021,30 @@ export default function PhotoStudio() {
         const { file, path } = fileEntries[i];
         setImportProgress({ current: i + 1, total, file: path });
 
-        const photo = await processMediaFile(file);
-        if (photo) {
-          photo.folderPath = path;
-          if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
-          existingFps.add(photo.fingerprint);
-          batch.push(photo);
-          added++;
-        }
+        try {
+          const photo = await processMediaFile(file);
+          if (photo) {
+            photo.folderPath = path;
+            if (existingFps.has(photo.fingerprint)) { skipped++; continue; }
+            existingFps.add(photo.fingerprint);
+            batch.push(photo);
+            added++;
+          }
+        } catch (e) { console.warn("processMediaFile error:", path, e); }
 
-        // Commit in batches of 30
-        if (batch.length >= 30 || i === total - 1) {
-          const toAdd = batch.splice(0, batch.length);
-          setPhotos((prev) => {
-            const u = [...prev, ...toAdd];
-            if (!selectedId && u.length > 0) setSelectedId(u[0].id);
-            savePhotos(u);
-            return u;
-          });
-          // Yield to UI
-          await new Promise((r) => setTimeout(r, 10));
+        // Commit in batches of 10 and yield to UI
+        if (batch.length >= 10 || i === total - 1) {
+          if (batch.length > 0) {
+            const toAdd = batch.splice(0, batch.length);
+            setPhotos((prev) => {
+              const u = [...prev, ...toAdd];
+              if (!selectedId && u.length > 0) setSelectedId(u[0].id);
+              savePhotos(u);
+              return u;
+            });
+          }
+          // Yield to UI so progress bar and React can update
+          await yieldToUI();
         }
       }
 
@@ -927,7 +1069,11 @@ export default function PhotoStudio() {
     const idSet = new Set(ids);
     setPhotos((prev) => {
       const u = prev.filter((p) => !idSet.has(p.id));
-      ids.forEach((id) => { delete imgCache.current[id]; dbDelete("photos", id).catch(() => {}); });
+      ids.forEach((id) => {
+        delete imgCache.current[id];
+        dbDelete("photos", id).catch(() => {});
+        dbDeleteBlob(id).catch(() => {});
+      });
       savePhotos(u);
       return u;
     });
@@ -1012,11 +1158,19 @@ export default function PhotoStudio() {
   const backupInputRef = useRef(null);
 
   const backupCatalog = useCallback(() => {
+    // Strip dataUrl from backup to keep file size manageable
+    const cleanPhotos = photos.map((p) => {
+      if (p.dataUrl) {
+        const { dataUrl, ...rest } = p;
+        return rest;
+      }
+      return p;
+    });
     const catalog = {
-      version: "1.0.0",
+      version: "1.1.0",
       exportedAt: new Date().toISOString(),
-      photoCount: photos.length,
-      photos,
+      photoCount: cleanPhotos.length,
+      photos: cleanPhotos,
       presets,
       collections,
     };
@@ -1193,7 +1347,7 @@ export default function PhotoStudio() {
     let totalDataSize = 0;
     let totalThumbSize = 0;
     photos.forEach((p) => {
-      if (p.dataUrl) totalDataSize += p.dataUrl.length;
+      if (p.size) totalDataSize += p.size; // use original file size
       if (p.thumbUrl) totalThumbSize += p.thumbUrl.length;
     });
 
@@ -1499,12 +1653,16 @@ export default function PhotoStudio() {
                 selected.mediaType === "video" ? (
                   // Video player
                   <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
-                    <video
-                      src={selected.dataUrl}
-                      controls
-                      autoPlay={false}
-                      style={{ maxWidth: "90%", maxHeight: "90%", borderRadius: 8, background: "#000" }}
-                    />
+                    {videoBlobUrl ? (
+                      <video
+                        src={videoBlobUrl}
+                        controls
+                        autoPlay={false}
+                        style={{ maxWidth: "90%", maxHeight: "90%", borderRadius: 8, background: "#000" }}
+                      />
+                    ) : (
+                      <div style={{ color: "#666", fontSize: 12 }}>動画を読み込み中...</div>
+                    )}
                   </div>
                 ) : compareMode === "side" && showBefore ? (
                   // Side-by-side
